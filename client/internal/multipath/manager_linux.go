@@ -551,12 +551,17 @@ func (m *linuxManager) configurePathLocked(peer *peerPaths, p *pathState, remote
 		return fmt.Errorf("multipath: configure peer on %s: %w", p.name, err)
 	}
 
+	// A path starts outside the route group and is promoted only after the
+	// prober has seen replies, so a path that never comes up cannot blackhole
+	// a share of the flows.
 	if p.state == PathStateInactive {
-		p.state = PathStateUp
-		p.prober.start(remote.Addr, remote.ProbePort, func(up bool) {
-			m.setPathState(peer.key, p.idx, up)
-		})
+		p.state = PathStateDown
 	}
+	// start is idempotent and also refreshes the probe target when the remote
+	// path is reconfigured with a new probe port.
+	p.prober.start(remote.Addr, remote.ProbePort, func(up bool) {
+		m.setPathState(peer.key, p.idx, up)
+	})
 	return nil
 }
 
@@ -605,14 +610,6 @@ func (m *linuxManager) removeSourceRoute(p *pathState) {
 // applyRouteLocked installs the ECMP route group for the peer's overlay
 // addresses, including only paths that are up. Callers must hold m.mu.
 func (m *linuxManager) applyRouteLocked(peer *peerPaths) {
-	// Drop routes for overlay addresses that are no longer part of the peer.
-	for _, old := range peer.installed {
-		if !containsAddr(peer.overlayIPs, old) {
-			m.deleteRoute(old)
-		}
-	}
-	peer.installed = nil
-
 	devs := []int{m.mainIface}
 	for idx := 1; idx <= len(peer.extras); idx++ {
 		p := peer.extras[idx]
@@ -621,6 +618,21 @@ func (m *linuxManager) applyRouteLocked(peer *peerPaths) {
 		}
 		devs = append(devs, p.linkIndex)
 	}
+
+	// Keep the group only while at least two paths are up and there is an
+	// overlay address to spread; otherwise remove every installed group.
+	keep := make(map[netip.Addr]bool)
+	if len(devs) >= 2 {
+		for _, overlay := range peer.overlayIPs {
+			keep[overlay] = true
+		}
+	}
+	for _, old := range peer.installed {
+		if !keep[old] {
+			m.deleteRoute(old)
+		}
+	}
+	peer.installed = nil
 
 	if len(devs) < 2 || len(peer.overlayIPs) == 0 {
 		return
@@ -838,15 +850,6 @@ func overlayAddrs(allowed []netip.Prefix, overlay netip.Prefix) []netip.Addr {
 		}
 	}
 	return out
-}
-
-func containsAddr(addrs []netip.Addr, addr netip.Addr) bool {
-	for _, a := range addrs {
-		if a == addr {
-			return true
-		}
-	}
-	return false
 }
 
 func prefixToIPNet(prefix netip.Prefix) *net.IPNet {
