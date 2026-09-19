@@ -150,14 +150,23 @@ func TestPickSlave(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestCandidatePort(t *testing.T) {
+func TestAllocatePortInBlock(t *testing.T) {
 	m := newTestManager(100)
 	m.cfg.WgPort = 51820
+	peer, p := testPeer()
+	p.port = 0
+	m.peers[peer.key] = peer
 
-	first := m.candidatePort("peer-key", 1, 0)
-	second := m.candidatePort("peer-key", 1, 1)
-	assert.NotEqual(t, first, second)
-	assert.NotEqual(t, m.cfg.WgPort, first)
-	assert.Greater(t, first, m.cfg.WgPort)
-	assert.Less(t, first, 65535)
+	first, err := m.allocatePortLocked(0, p)
+	require.NoError(t, err)
+	p.port = uint16(first)
+	assert.GreaterOrEqual(t, first, m.cfg.WgPort+1)
+	assert.Less(t, first, m.cfg.WgPort+1+pathPortRangeSize)
+
+	p2 := &pathState{idx: 2, name: "wtp-test2", linkIndex: 201}
+	peer.extras[2] = p2
+	second, err := m.allocatePortLocked(0, p2)
+	require.NoError(t, err)
+	assert.NotEqual(t, first, second, "each path gets its own port")
+	assert.Less(t, second, m.cfg.WgPort+1+pathPortRangeSize)
 }

@@ -88,6 +88,31 @@ Both measurements adapt to any bond hash policy and are skipped on underlays
 that are not bonds. The chosen member is logged per path, and repeated offers
 with the same endpoints skip the measurement.
 
+## Multiple uplinks and public IPs
+
+A bond is not required. Each path is pinned to the interface that owns its
+configured address, and its source route is resolved through that interface,
+so multipath also works with independent interfaces:
+
+- **Public IPs directly on the interfaces.** Supported. Traffic leaves
+  through the interface that owns the configured address even when the host
+  has several default routes.
+- **No bond.** Supported. There is nothing to place on a LAG, so member
+  placement is skipped and the paths simply use their interfaces.
+- **NATed multi-WAN (public IPs on upstream routers).** Not supported yet.
+  The extra paths have no STUN or hole punching, so the addresses in
+  `--multipath-local-addresses` must be reachable from the peer. Only the main
+  connection performs NAT traversal.
+
+Practical notes for internet deployments:
+
+- Path interfaces listen on `WireGuard port + 1` through `+64`, and probe
+  sockets use ephemeral ports bound to the path addresses. Allow that UDP
+  range inbound on each interface that carries a path.
+- ECMP is per flow. Two long-lived flows can both hash to one uplink; more
+  flows spread better. There is no per-packet scheduler.
+- Asymmetric uplinks work, but a flow is limited by the interface it lands on.
+
 ## Status and metrics
 
 `netbird status --json` lists the paths of each peer:
@@ -194,3 +219,6 @@ Measured on a local test cluster (kernel WireGuard, 2x1 Gbit LACP):
   is not encrypted and the member cannot be measured.
 - Multipath is disabled with a firewall error: the active firewall backend
   cannot cover extra interfaces. Use nftables or disable the NetBird firewall.
+- A path stays `down` with a "route to ... via ..." error: the remote path
+  address is not reachable through the interface that owns the configured
+  local address. Check that both interfaces can route to the peer.

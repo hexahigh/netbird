@@ -23,6 +23,11 @@ import (
 const (
 	pathIfacePrefix = "wtp"
 
+	// pathPortRangeSize is the number of ports above the main WireGuard port
+	// that path interfaces listen on. Keeping the paths in one small block
+	// makes the firewall rule a single range for internet deployments.
+	pathPortRangeSize = 64
+
 	// keepaliveInterval matches the main peer so path sessions stay alive and
 	// NAT mappings do not expire.
 	keepaliveInterval = 25 * time.Second
@@ -165,11 +170,14 @@ type pathState struct {
 	port      uint16
 	probePort uint16
 	linkIndex int
-	remote    PathEndpoint
-	state     PathState
-	member    string
-	prober    *prober
-	srcRoute  *netlink.Route
+	// ifaceIndex is the interface that owns the local path address. Egress is
+	// pinned to it, which matters when several interfaces have default routes.
+	ifaceIndex int
+	remote     PathEndpoint
+	state      PathState
+	member     string
+	prober     *prober
+	srcRoute   *netlink.Route
 }
 
 // LocalPaths returns the extra paths advertised to a peer, creating the path
@@ -511,15 +519,31 @@ func (m *linuxManager) createPathLocked(peer *peerPaths, idx int, local netip.Ad
 		return nil, fmt.Errorf("multipath: missing attributes for %s", name)
 	}
 
-	if err := m.configureDevice(name, peer.key, idx); err != nil {
+	ifaceIndex, err := ifaceIndexForAddr(local)
+	if err != nil {
 		_ = netlink.LinkDel(link)
 		return nil, err
 	}
-	dev, err := m.wg.Device(name)
+
+	if err := m.configureDevice(name); err != nil {
+		_ = netlink.LinkDel(link)
+		return nil, err
+	}
+
+	p := &pathState{
+		idx:        idx,
+		name:       name,
+		local:      local,
+		linkIndex:  attrs.Index,
+		ifaceIndex: ifaceIndex,
+		state:      PathStateInactive,
+	}
+	port, err := m.allocatePortLocked(0, p)
 	if err != nil {
 		_ = netlink.LinkDel(link)
-		return nil, fmt.Errorf("multipath: read %s: %w", name, err)
+		return nil, fmt.Errorf("multipath: allocate port for %s: %w", name, err)
 	}
+	p.port = uint16(port)
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: local.AsSlice(), Port: 0})
 	if err != nil {
@@ -532,41 +556,73 @@ func (m *linuxManager) createPathLocked(peer *peerPaths, idx int, local netip.Ad
 		_ = netlink.LinkDel(link)
 		return nil, err
 	}
-
-	p := &pathState{
-		idx:       idx,
-		name:      name,
-		local:     local,
-		port:      uint16(dev.ListenPort),
-		probePort: probePort,
-		linkIndex: attrs.Index,
-		state:     PathStateInactive,
-	}
+	p.probePort = probePort
 	p.prober = newProber(m.log.WithField("path", name), conn, m.ctx)
 	return p, nil
 }
 
-// configureDevice creates the WireGuard device of a path. The listen port is
-// derived from the peer key so it is stable across restarts and unique among
-// peers, which makes the outer tuple, and with it the bond member assignment,
-// reproducible. If the port is taken, fall back to a kernel-assigned one.
-func (m *linuxManager) configureDevice(name, peerKey string, idx int) error {
-	cfg := wgtypes.Config{
+// allocatePortLocked binds a path to a port inside the block above the main
+// WireGuard port. preferred is tried first, then the rest of the block.
+// Callers must hold m.mu.
+func (m *linuxManager) allocatePortLocked(preferred int, p *pathState) (int, error) {
+	if m.cfg.WgPort <= 0 || m.cfg.WgPort+pathPortRangeSize > 65535 {
+		return 0, errors.New("main WireGuard port leaves no path port range")
+	}
+	if preferred > 0 {
+		if actual, err := m.tryPathPortLocked(preferred, p); err == nil {
+			return actual, nil
+		}
+	}
+	for i := 0; i < pathPortRangeSize; i++ {
+		port := m.cfg.WgPort + 1 + i
+		if actual, err := m.tryPathPortLocked(port, p); err == nil {
+			return actual, nil
+		}
+	}
+	return 0, errors.New("no free port in the path port range")
+}
+
+func (m *linuxManager) tryPathPortLocked(port int, p *pathState) (int, error) {
+	if port == m.cfg.WgPort || m.portUsedLocked(port, p) {
+		return 0, errors.New("port in use")
+	}
+	actual, err := m.setDevicePort(p.name, port)
+	if err != nil || actual == 0 {
+		return 0, errors.New("bind failed")
+	}
+	return actual, nil
+}
+
+// ifaceIndexForAddr returns the interface that owns a local address, so the
+// path egress is pinned to that interface instead of whatever the routing
+// table prefers for the remote address.
+func ifaceIndexForAddr(addr netip.Addr) (int, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return 0, fmt.Errorf("multipath: list interfaces: %w", err)
+	}
+	for _, link := range links {
+		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if a.IP.Equal(addr.AsSlice()) {
+				return link.Attrs().Index, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("multipath: address %s is not assigned to an interface", addr)
+}
+
+// configureDevice creates the WireGuard device of a path with a kernel chosen
+// port. The portable port is assigned afterwards from the path port range.
+func (m *linuxManager) configureDevice(name string) error {
+	if err := m.wg.ConfigureDevice(name, wgtypes.Config{
 		PrivateKey:   &m.cfg.PrivateKey,
 		ReplacePeers: true,
-	}
-	if port := m.candidatePort(peerKey, idx, 0); port > 0 && port <= 65535 {
-		cfg.ListenPort = &port
-	}
-	if err := m.wg.ConfigureDevice(name, cfg); err != nil {
-		if cfg.ListenPort == nil {
-			return fmt.Errorf("multipath: configure %s: %w", name, err)
-		}
-		m.log.Warnf("port %d is not available for %s, using a random port: %v", *cfg.ListenPort, name, err)
-		cfg.ListenPort = nil
-		if err := m.wg.ConfigureDevice(name, cfg); err != nil {
-			return fmt.Errorf("multipath: configure %s: %w", name, err)
-		}
+	}); err != nil {
+		return fmt.Errorf("multipath: configure %s: %w", name, err)
 	}
 	return nil
 }
@@ -701,12 +757,19 @@ func (m *linuxManager) setSourceRoute(p *pathState, remote PathEndpoint) error {
 		m.removeSourceRoute(p)
 	}
 
-	routes, err := netlink.RouteGet(remote.Addr.AsSlice())
+	// Resolve the route through the interface that owns the local path
+	// address. With several default routes the routing table may otherwise
+	// pick a different egress interface and send the path's traffic out with
+	// a source address that does not belong to it.
+	routes, err := netlink.RouteGetWithOptions(remote.Addr.AsSlice(), &netlink.RouteGetOptions{
+		OifIndex: p.ifaceIndex,
+		SrcAddr:  p.local.AsSlice(),
+	})
 	if err != nil {
-		return fmt.Errorf("multipath: route to %s: %w", remote.Addr, err)
+		return fmt.Errorf("multipath: route to %s via %s: %w", remote.Addr, p.local, err)
 	}
 	if len(routes) == 0 {
-		return fmt.Errorf("multipath: no route to %s", remote.Addr)
+		return fmt.Errorf("multipath: no route to %s via interface %d", remote.Addr, p.ifaceIndex)
 	}
 	underlay := routes[0]
 	route := &netlink.Route{

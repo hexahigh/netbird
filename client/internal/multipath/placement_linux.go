@@ -417,38 +417,19 @@ func (m *linuxManager) revertPortLocked(p *pathState, original uint16) {
 	}
 }
 
-// rerollPortLocked gives a path a new listen port that is not used by the main
-// connection or any other path. Callers must hold m.mu.
-func (m *linuxManager) rerollPortLocked(peer *peerPaths, p *pathState, attempt int) error {
-	for i := 0; i < maxPlacementAttempts; i++ {
-		port := m.candidatePort(peer.key, p.idx, attempt+i)
-		if port == m.cfg.WgPort || m.portUsedLocked(port, p) {
-			continue
-		}
-		actual, err := m.setDevicePort(p.name, port)
-		if err != nil || actual == 0 {
-			continue
-		}
-		p.port = uint16(actual)
-		return nil
+// rerollPortLocked gives a path a new listen port from the path port range.
+// Callers must hold m.mu.
+func (m *linuxManager) rerollPortLocked(_ *peerPaths, p *pathState, attempt int) error {
+	preferred := int(p.port) + 1 + attempt
+	if preferred > m.cfg.WgPort+pathPortRangeSize {
+		preferred = m.cfg.WgPort + 1
 	}
-	return errors.New("no free candidate port")
-}
-
-// candidatePort maps a peer and path index to a port in a private range above
-// the main port. attempt selects the next candidate.
-func (m *linuxManager) candidatePort(peerKey string, idx, attempt int) int {
-	if m.cfg.WgPort <= 0 {
-		return 0
+	port, err := m.allocatePortLocked(preferred, p)
+	if err != nil {
+		return err
 	}
-	span := 500 * maxPathIfaces
-	slot := int(peerHash(peerKey)%uint32(500))*maxPathIfaces + idx - 1 + attempt
-	slot %= span
-	port := m.cfg.WgPort + 1 + slot
-	if port > 65535 {
-		port = m.cfg.WgPort - 1 - slot
-	}
-	return port
+	p.port = uint16(port)
+	return nil
 }
 
 // portUsedLocked reports whether a port is already used by one of the paths of
