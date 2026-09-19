@@ -16,6 +16,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/peer"
 )
 
@@ -33,6 +34,7 @@ const (
 // statusSource provides the connection state snapshots the collector reads on scrape.
 type statusSource interface {
 	GetPeerStates() []peer.State
+	GetPeerPaths(peerKey string) []multipath.PathStatus
 	GetManagementState() peer.ManagementState
 	GetSignalState() peer.SignalState
 }
@@ -164,6 +166,11 @@ type collector struct {
 	peersTotal          *prometheus.Desc
 	peersConnected      *prometheus.Desc
 	peerLatency         *prometheus.Desc
+	peerPathUp          *prometheus.Desc
+	peerPathRTT         *prometheus.Desc
+	peerPathLoss        *prometheus.Desc
+	peerPathTxBytes     *prometheus.Desc
+	peerPathRxBytes     *prometheus.Desc
 }
 
 func newCollector(status statusSource) *collector {
@@ -194,6 +201,31 @@ func newCollector(status statusSource) *collector {
 			"Round-trip latency per directly connected peer; relayed connections have no latency measurement.",
 			[]string{"peer"}, nil,
 		),
+		peerPathUp: prometheus.NewDesc(
+			"netbird_peer_path_up",
+			"Whether a multipath underlay path is in the route group (1 up, 0 down).",
+			[]string{"peer", "path", "local", "remote"}, nil,
+		),
+		peerPathRTT: prometheus.NewDesc(
+			"netbird_peer_path_rtt_seconds",
+			"Probe round-trip time of a multipath underlay path.",
+			[]string{"peer", "path"}, nil,
+		),
+		peerPathLoss: prometheus.NewDesc(
+			"netbird_peer_path_loss_ratio",
+			"Probe loss ratio of a multipath underlay path.",
+			[]string{"peer", "path"}, nil,
+		),
+		peerPathTxBytes: prometheus.NewDesc(
+			"netbird_peer_path_transmit_bytes_total",
+			"WireGuard bytes transmitted on a multipath underlay path.",
+			[]string{"peer", "path"}, nil,
+		),
+		peerPathRxBytes: prometheus.NewDesc(
+			"netbird_peer_path_receive_bytes_total",
+			"WireGuard bytes received on a multipath underlay path.",
+			[]string{"peer", "path"}, nil,
+		),
 	}
 }
 
@@ -204,6 +236,11 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.peersTotal
 	ch <- c.peersConnected
 	ch <- c.peerLatency
+	ch <- c.peerPathUp
+	ch <- c.peerPathRTT
+	ch <- c.peerPathLoss
+	ch <- c.peerPathTxBytes
+	ch <- c.peerPathRxBytes
 }
 
 // Collect implements prometheus.Collector.
@@ -227,6 +264,19 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 
 		if latency := p.Latency.Seconds(); latency > 0 {
 			ch <- prometheus.MustNewConstMetric(c.peerLatency, prometheus.GaugeValue, latency, p.FQDN)
+		}
+
+		for _, path := range c.status.GetPeerPaths(p.PubKey) {
+			up := 0.0
+			if path.State == multipath.PathStateUp {
+				up = 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.peerPathUp, prometheus.GaugeValue, up,
+				p.FQDN, path.Interface, path.Local.String(), path.Remote.String())
+			ch <- prometheus.MustNewConstMetric(c.peerPathRTT, prometheus.GaugeValue, path.RTT.Seconds(), p.FQDN, path.Interface)
+			ch <- prometheus.MustNewConstMetric(c.peerPathLoss, prometheus.GaugeValue, path.Loss, p.FQDN, path.Interface)
+			ch <- prometheus.MustNewConstMetric(c.peerPathTxBytes, prometheus.CounterValue, float64(path.TxBytes), p.FQDN, path.Interface)
+			ch <- prometheus.MustNewConstMetric(c.peerPathRxBytes, prometheus.CounterValue, float64(path.RxBytes), p.FQDN, path.Interface)
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.peersConnected, prometheus.GaugeValue, p2p, "p2p")

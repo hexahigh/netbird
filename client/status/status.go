@@ -81,6 +81,21 @@ type PeerStateDetailOutput struct {
 	Latency                time.Duration    `json:"latency" yaml:"latency"`
 	RosenpassEnabled       bool             `json:"quantumResistance" yaml:"quantumResistance"`
 	Networks               []string         `json:"networks" yaml:"networks"`
+	// Paths lists the extra underlay paths when multipath is active.
+	Paths []PathStateDetailOutput `json:"paths,omitempty" yaml:"paths,omitempty"`
+}
+
+// PathStateDetailOutput is one extra underlay path of a peer.
+type PathStateDetailOutput struct {
+	Local         string        `json:"local" yaml:"local"`
+	Remote        string        `json:"remote" yaml:"remote"`
+	Interface     string        `json:"interface" yaml:"interface"`
+	State         string        `json:"state" yaml:"state"`
+	TransferSent  int64         `json:"transferSent" yaml:"transferSent"`
+	TransferRecv  int64         `json:"transferReceived" yaml:"transferReceived"`
+	LastHandshake time.Time     `json:"lastWireguardHandshake,omitempty" yaml:"lastWireguardHandshake,omitempty"`
+	RTT           time.Duration `json:"rtt,omitempty" yaml:"rtt,omitempty"`
+	Loss          float64       `json:"loss" yaml:"loss"`
 }
 
 type PeersStateOutput struct {
@@ -368,6 +383,7 @@ func mapPeers(
 			Latency:                pbPeerState.GetLatency().AsDuration(),
 			RosenpassEnabled:       pbPeerState.GetRosenpassEnabled(),
 			Networks:               pbPeerState.GetNetworks(),
+			Paths:                  mapPathStates(pbPeerState.GetPaths()),
 		}
 
 		peersStateDetail = append(peersStateDetail, peerState)
@@ -381,6 +397,31 @@ func mapPeers(
 		Details:   peersStateDetail,
 	}
 	return peersOverview
+}
+
+// mapPathStates converts multipath path states to the CLI output type.
+func mapPathStates(paths []*proto.PathState) []PathStateDetailOutput {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]PathStateDetailOutput, 0, len(paths))
+	for _, p := range paths {
+		path := PathStateDetailOutput{
+			Local:        p.GetLocal(),
+			Remote:       p.GetRemote(),
+			Interface:    p.GetIface(),
+			State:        p.GetState(),
+			TransferSent: p.GetTxBytes(),
+			TransferRecv: p.GetRxBytes(),
+			RTT:          time.Duration(p.GetRttMillis()) * time.Millisecond,
+			Loss:         p.GetLoss(),
+		}
+		if p.GetLastHandshake() > 0 {
+			path.LastHandshake = time.Unix(p.GetLastHandshake(), 0).Local()
+		}
+		out = append(out, path)
+	}
+	return out
 }
 
 func sortPeersByIP(peersStateDetail []PeerStateDetailOutput) {
@@ -715,6 +756,24 @@ func ToProtoFullStatus(fullStatus peer.FullStatus) *proto.FullStatus {
 			Networks:                   maps.Keys(peerState.GetRoutes()),
 			Latency:                    durationpb.New(peerState.Latency),
 			SshHostKey:                 peerState.SSHHostKey,
+		}
+		if fullStatus.PathProvider != nil {
+			for _, path := range fullStatus.PathProvider(peerState.PubKey) {
+				pbPath := &proto.PathState{
+					Local:     path.Local.String(),
+					Remote:    path.Remote.String(),
+					Iface:     path.Interface,
+					State:     string(path.State),
+					TxBytes:   path.TxBytes,
+					RxBytes:   path.RxBytes,
+					RttMillis: path.RTT.Milliseconds(),
+					Loss:      path.Loss,
+				}
+				if !path.LastHandshake.IsZero() {
+					pbPath.LastHandshake = path.LastHandshake.Unix()
+				}
+				pbPeerState.Paths = append(pbPeerState.Paths, pbPath)
+			}
 		}
 		pbFullStatus.Peers = append(pbFullStatus.Peers, pbPeerState)
 	}

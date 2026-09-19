@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -14,16 +15,21 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/peer"
 )
 
 type stubStatus struct {
 	peers      []peer.State
+	paths      map[string][]multipath.PathStatus
 	management peer.ManagementState
 	signal     peer.SignalState
 }
 
-func (s *stubStatus) GetPeerStates() []peer.State              { return s.peers }
+func (s *stubStatus) GetPeerStates() []peer.State { return s.peers }
+func (s *stubStatus) GetPeerPaths(peerKey string) []multipath.PathStatus {
+	return s.paths[peerKey]
+}
 func (s *stubStatus) GetManagementState() peer.ManagementState { return s.management }
 func (s *stubStatus) GetSignalState() peer.SignalState         { return s.signal }
 
@@ -31,8 +37,20 @@ func testStatus() *stubStatus {
 	return &stubStatus{
 		management: peer.ManagementState{Connected: true},
 		signal:     peer.SignalState{Connected: true},
+		paths: map[string][]multipath.PathStatus{
+			"peer-a-key": {{
+				Local:     multipath.PathEndpoint{Addr: netip.MustParseAddr("192.168.6.161"), Port: 51821},
+				Remote:    multipath.PathEndpoint{Addr: netip.MustParseAddr("192.168.6.171"), Port: 51821},
+				Interface: "wtp1",
+				State:     multipath.PathStateUp,
+				TxBytes:   1234,
+				RxBytes:   5678,
+				RTT:       5 * time.Millisecond,
+				Loss:      0.1,
+			}},
+		},
 		peers: []peer.State{
-			{FQDN: "peer-a.netbird.cloud", IP: "100.90.0.1", ConnStatus: peer.StatusConnected, Relayed: false, Latency: 12 * time.Millisecond},
+			{FQDN: "peer-a.netbird.cloud", IP: "100.90.0.1", PubKey: "peer-a-key", ConnStatus: peer.StatusConnected, Relayed: false, Latency: 12 * time.Millisecond},
 			{FQDN: "peer-b.netbird.cloud", IP: "100.90.0.2", ConnStatus: peer.StatusConnected, Relayed: false, Latency: 36 * time.Millisecond},
 			{FQDN: "peer-c.netbird.cloud", IP: "100.90.0.3", ConnStatus: peer.StatusConnected, Relayed: true},
 			{FQDN: "peer-d.netbird.cloud", IP: "100.90.0.4", ConnStatus: peer.StatusIdle},
@@ -51,6 +69,21 @@ netbird_management_connected 1
 # TYPE netbird_peer_latency_seconds gauge
 netbird_peer_latency_seconds{peer="peer-a.netbird.cloud"} 0.012
 netbird_peer_latency_seconds{peer="peer-b.netbird.cloud"} 0.036
+# HELP netbird_peer_path_loss_ratio Probe loss ratio of a multipath underlay path.
+# TYPE netbird_peer_path_loss_ratio gauge
+netbird_peer_path_loss_ratio{path="wtp1",peer="peer-a.netbird.cloud"} 0.1
+# HELP netbird_peer_path_receive_bytes_total WireGuard bytes received on a multipath underlay path.
+# TYPE netbird_peer_path_receive_bytes_total counter
+netbird_peer_path_receive_bytes_total{path="wtp1",peer="peer-a.netbird.cloud"} 5678
+# HELP netbird_peer_path_rtt_seconds Probe round-trip time of a multipath underlay path.
+# TYPE netbird_peer_path_rtt_seconds gauge
+netbird_peer_path_rtt_seconds{path="wtp1",peer="peer-a.netbird.cloud"} 0.005
+# HELP netbird_peer_path_transmit_bytes_total WireGuard bytes transmitted on a multipath underlay path.
+# TYPE netbird_peer_path_transmit_bytes_total counter
+netbird_peer_path_transmit_bytes_total{path="wtp1",peer="peer-a.netbird.cloud"} 1234
+# HELP netbird_peer_path_up Whether a multipath underlay path is in the route group (1 up, 0 down).
+# TYPE netbird_peer_path_up gauge
+netbird_peer_path_up{local="192.168.6.161:51821",path="wtp1",peer="peer-a.netbird.cloud",remote="192.168.6.171:51821"} 1
 # HELP netbird_peers Number of peers known to this client.
 # TYPE netbird_peers gauge
 netbird_peers 4

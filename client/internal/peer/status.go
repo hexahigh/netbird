@@ -21,6 +21,7 @@ import (
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 	"github.com/netbirdio/netbird/client/iface/configurer"
 	"github.com/netbirdio/netbird/client/internal/ingressgw"
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/relay"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/route"
@@ -164,6 +165,10 @@ type FullStatus struct {
 	NumOfForwardingRules  int
 	LazyConnectionEnabled bool
 	Events                []*proto.SystemEvent
+
+	// PathProvider returns the multipath states of a peer, keyed by its
+	// WireGuard public key. Nil when multipath is disabled.
+	PathProvider func(peerKey string) []multipath.PathStatus
 }
 
 type StatusChangeSubscription struct {
@@ -207,6 +212,7 @@ type Status struct {
 	mgmAddress          string
 	signalAddress       string
 	notifier            *notifier
+	pathProvider        func(peerKey string) []multipath.PathStatus
 	rosenpassEnabled    bool
 	rosenpassPermissive bool
 	// sessionExpiresAt is the absolute UTC instant at which the peer's SSO
@@ -1044,6 +1050,27 @@ func (d *Status) GetRosenpassState() RosenpassState {
 	}
 }
 
+// SetPathProvider registers the multipath state provider. Nil disables path
+// reporting.
+func (d *Status) SetPathProvider(provider func(peerKey string) []multipath.PathStatus) {
+	d.mux.Lock()
+	defer d.mux.Unlock()
+	d.pathProvider = provider
+}
+
+// GetPeerPaths returns the multipath states of a peer, or nil when multipath
+// is disabled.
+func (d *Status) GetPeerPaths(peerKey string) []multipath.PathStatus {
+	d.mux.RLock()
+	provider := d.pathProvider
+	d.mux.RUnlock()
+
+	if provider == nil {
+		return nil
+	}
+	return provider(peerKey)
+}
+
 func (d *Status) GetLazyConnection() bool {
 	d.mux.RLock()
 	defer d.mux.RUnlock()
@@ -1195,6 +1222,7 @@ func (d *Status) GetFullStatus() FullStatus {
 	defer d.mux.RUnlock()
 
 	fullStatus.LocalPeerState = d.localPeer
+	fullStatus.PathProvider = d.pathProvider
 
 	for _, status := range d.peers {
 		fullStatus.Peers = append(fullStatus.Peers, status)
@@ -1587,6 +1615,24 @@ func (fs FullStatus) ToProto() *proto.FullStatus {
 			Networks:                   networks,
 			Latency:                    durationpb.New(peerState.Latency),
 			SshHostKey:                 peerState.SSHHostKey,
+		}
+		if fs.PathProvider != nil {
+			for _, path := range fs.PathProvider(peerState.PubKey) {
+				pbPath := &proto.PathState{
+					Local:     path.Local.String(),
+					Remote:    path.Remote.String(),
+					Iface:     path.Interface,
+					State:     string(path.State),
+					TxBytes:   path.TxBytes,
+					RxBytes:   path.RxBytes,
+					RttMillis: path.RTT.Milliseconds(),
+					Loss:      path.Loss,
+				}
+				if !path.LastHandshake.IsZero() {
+					pbPath.LastHandshake = path.LastHandshake.Unix()
+				}
+				pbPeerState.Paths = append(pbPeerState.Paths, pbPath)
+			}
 		}
 		pbFullStatus.Peers = append(pbFullStatus.Peers, pbPeerState)
 	}

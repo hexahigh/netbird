@@ -410,7 +410,30 @@ message PeerState {
   google.protobuf.Duration latency = 17;
   string relayAddress = 18;
   bytes sshHostKey = 19;
+
+  // paths lists the extra underlay paths of this peer when multipath is
+  // active.
+  repeated PathState paths = 21;
   string ipv6 = 20;
+}
+
+// PathState describes one extra underlay path of a peer connection.
+message PathState {
+  // local is the local underlay address:port of the path.
+  string local = 1;
+  // remote is the remote underlay address:port of the path.
+  string remote = 2;
+  // iface is the path's WireGuard interface name.
+  string iface = 3;
+  // state is "up" or "down".
+  string state = 4;
+  int64 txBytes = 5;
+  int64 rxBytes = 6;
+  // lastHandshake is the unix time of the last WireGuard handshake, zero
+  // when no session is established.
+  int64 lastHandshake = 7;
+  int64 rttMillis = 8;
+  double loss = 9;
 }
 
 // LocalPeerState contains the latest state of the local peer

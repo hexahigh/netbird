@@ -666,6 +666,9 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	}
 
 	e.bindMultipathFirewall()
+	if e.multipathManager != nil {
+		e.statusRecorder.SetPathProvider(e.multipathManager.PathStates)
+	}
 
 	// Inject firewall into DNS server now that it's available.
 	// The DNS server is created before the firewall because the route manager
@@ -2077,6 +2080,7 @@ func (e *Engine) disableMultipath() {
 		log.Warnf("failed to stop multipath manager: %v", err)
 	}
 	e.multipathManager = nil
+	e.statusRecorder.SetPathProvider(nil)
 }
 
 // presharedKeyProvider exposes the Rosenpass-managed key of a peer to the
