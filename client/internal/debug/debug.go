@@ -742,6 +742,10 @@ func (g *BundleGenerator) addCommonConfigFields(configContent *strings.Builder) 
 	configContent.WriteString(fmt.Sprintf("DisableIPv6: %v\n", g.internalConfig.DisableIPv6))
 	configContent.WriteString(fmt.Sprintf("LocalMetricsEnabled: %v\n", g.internalConfig.LocalMetricsEnabled))
 	configContent.WriteString(fmt.Sprintf("LocalMetricsAddress: %s\n", g.internalConfig.LocalMetricsAddress))
+	configContent.WriteString(fmt.Sprintf("Multipath: %v\n", g.internalConfig.Multipath))
+	configContent.WriteString(fmt.Sprintf("MultipathMode: %s\n", g.internalConfig.MultipathMode))
+	configContent.WriteString(fmt.Sprintf("MultipathMaxPaths: %d\n", g.internalConfig.MultipathMaxPaths))
+	configContent.WriteString(fmt.Sprintf("MultipathLocalAddresses: %v\n", g.internalConfig.MultipathLocalAddresses))
 	configContent.WriteString(fmt.Sprintf("SyncMessageVersion: %v\n", g.internalConfig.SyncMessageVersion))
 
 	if g.internalConfig.DisableNotifications != nil {
