@@ -32,13 +32,14 @@ const (
 	// count as usable.
 	handshakeFreshness = 30 * time.Second
 	// maxPlacementFailures bounds placement retries when measurement keeps
-	// failing, for example while a path session cannot be established.
-	maxPlacementFailures = 5
+	// failing, for example while a path session cannot be established. A
+	// fresh connection can need tens of seconds before traffic flows.
+	maxPlacementFailures = 20
 	// placementRetryDelay is the pause before a failed measurement is retried.
 	placementRetryDelay = 2 * time.Second
 	// counterSettleDelay lets the bond qdisc drain into the slaves before the
 	// transmit counters are read; reading earlier misses the burst.
-	counterSettleDelay = 300 * time.Millisecond
+	counterSettleDelay = 500 * time.Millisecond
 	// burstPort is the destination port of the placement burst. Traffic to it
 	// is expected to be dropped by the remote peer; only the local egress
 	// bond member matters.
