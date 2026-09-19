@@ -428,6 +428,23 @@ func (conn *Conn) ConnID() id.ConnID {
 }
 
 // configureConnection starts proxying traffic from/to local Wireguard and sets connection status to StatusConnected
+// RefreshPaths sends a fresh offer so the remote peer picks up changed path
+// endpoints. It is safe to call from other goroutines and does nothing when
+// the connection is closed.
+func (conn *Conn) RefreshPaths() {
+	conn.mu.Lock()
+	handshaker := conn.handshaker
+	opened := conn.opened
+	conn.mu.Unlock()
+
+	if !opened || handshaker == nil {
+		return
+	}
+	if err := handshaker.SendOffer(); err != nil {
+		conn.Log.Debugf("multipath: refresh paths: %v", err)
+	}
+}
+
 // onRemoteMultipath applies the extra underlay paths advertised by the remote
 // peer. It runs on the handshaker goroutine.
 func (conn *Conn) onRemoteMultipath(offer *OfferAnswer) {

@@ -25,7 +25,7 @@ The feature is off by default.
 
 ```
 netbird up --multipath \
-  --multipath-local-addresses 192.168.6.161 \
+  --multipath-local-addresses 10.10.0.11 \
   --multipath-max-paths 2
 ```
 
@@ -56,7 +56,7 @@ pairs for the paths.
 One ECMP route per peer overlay address spreads the inner flows:
 
 ```
-100.110.181.147/32
+100.64.0.3/32
     nexthop dev wt0
     nexthop dev wtp9bea91
 ```
@@ -70,13 +70,15 @@ Each path runs a small UDP echo prober on a separate port. A path that misses
 three probes is removed from the route group; three successful probes put it
 back. The relay remains the fallback when every direct path is gone.
 
-Path listen ports are derived from the main port, the peer key, and the side's
-own key, so the outer tuples, and with them the bond member assignment, are
-stable across restarts. The two ends use different offsets on purpose: a bond
-hash that includes ports needs distinct source and destination ports to spread
-the flows. On hardware where both paths still land on one member, shift one end
-with `NB_MULTIPATH_PORT_OFFSET` (an integer added to that side's port range)
-and verify the member counters.
+Bond member placement is measured, not guessed. When a path is configured the
+client steers the peer's overlay traffic through the path, sends a short UDP
+burst, and reads the bond member counters to see which member carried it. If
+the path landed on the same member as the main connection, the client moves it
+to a different listen port and measures again, then tells the remote peer the
+new endpoint with a fresh offer. The measurement adapts to any bond hash
+policy, and it is skipped on underlays that are not bonds. The chosen member is
+logged per path and repeated offers with the same endpoints skip the
+measurement.
 
 ## Status and metrics
 
@@ -85,8 +87,8 @@ and verify the member counters.
 ```json
 "paths": [
   {
-    "local": "192.168.6.162:44851",
-    "remote": "192.168.6.172:43573",
+    "local": "10.10.0.11:44851",
+    "remote": "10.10.0.21:43573",
     "interface": "wtp9bea91",
     "state": "up",
     "transferSent": 123,
@@ -115,35 +117,36 @@ endpoint:
   main path because the kernel rejects device-only IPv6 multipath nexthops.
 - One pair of path interfaces per peer and path, so the interface count grows
   with peers times paths. Keep `--multipath-max-paths` small.
-- Both underlay addresses should be behind the same layer 3 path. On a bond
-  whose hash is address based, pick address pairs that map to different
-  members and verify with the member counters (below). Addresses that differ
-  by one in the last octet can collide on XOR-style hashes.
+- Both underlay addresses should be behind the same bond. Placement moves the
+  path flows to different members automatically, but a bond hash that ignores
+  ports cannot be influenced from the client.
 - Relay, lazy connections and Rosenpass keep working: a lazy peer only gets
   paths while its connection is open, and Rosenpass keys are applied to every
   path interface. Multipath is not a replacement for the relay fallback.
 
-## Benchmark on the glemmen cluster
+## Benchmark on a local test cluster
 
-Two nodes with a 2x1 Gbit LACP bond, one extra address per node:
+Two nodes on the same layer 2 segment, each with a 2x1 Gbit LACP bond and one
+extra underlay address. Replace the example addresses and interface names with
+the ones on your test nodes.
 
 ```bash
-# Node A (192.168.6.160, overlay 100.110.22.143)
-sudo ip addr add 192.168.6.162/24 dev bond0
-netbird up --multipath --multipath-local-addresses 192.168.6.162
+# Node A (underlay 192.168.1.10, overlay 100.64.0.2)
+sudo ip addr add 192.168.1.11/24 dev bond0
+netbird up --multipath --multipath-local-addresses 192.168.1.11
 
-# Node B (192.168.6.170, overlay 100.110.181.147)
-sudo ip addr add 192.168.6.172/24 dev bond0
-netbird up --multipath --multipath-local-addresses 192.168.6.172
+# Node B (underlay 192.168.1.20, overlay 100.64.0.3)
+sudo ip addr add 192.168.1.21/24 dev bond0
+netbird up --multipath --multipath-local-addresses 192.168.1.21
 
-# Aggregate throughput, expecting > 1.7 Gbit/s
-iperf3 -c 100.110.181.147 -P 8 -t 20
+# Aggregate throughput, expecting close to the sum of the links
+iperf3 -c 100.64.0.3 -P 8 -t 20
 
 # Single stream stays on one link
-iperf3 -c 100.110.181.147 -P 1 -t 10
+iperf3 -c 100.64.0.3 -P 1 -t 10
 
 # Bond member usage during a run
-for i in eno8303 eno8403; do
+for i in eth0 eth1; do
   echo "$i $(cat /sys/class/net/$i/statistics/tx_bytes)"
 done
 ```
@@ -151,12 +154,12 @@ done
 Failover check, on the receiving node:
 
 ```bash
-sudo iptables -I INPUT 1 -s 192.168.6.162 -j DROP   # drop path 1
+sudo iptables -I INPUT 1 -s 192.168.1.11 -j DROP   # drop path 1
 # throughput drops to one link, the connection stays up
-sudo iptables -D INPUT -s 192.168.6.162 -j DROP     # recover
+sudo iptables -D INPUT -s 192.168.1.11 -j DROP     # recover
 ```
 
-Measured on glemmen160/170 with kernel WireGuard:
+Measured on a local test cluster (kernel WireGuard, 2x1 Gbit LACP):
 
 | Test | Result |
 | --- | --- |
@@ -164,7 +167,7 @@ Measured on glemmen160/170 with kernel WireGuard:
 | `iperf3 -P 1` | 896 Mbit/s |
 | UDP, single flow at 850 Mbit/s offered | 0.82% loss |
 | Path 1 blocked during a 30s `-P 8` run | 1806 Mbit/s, then 901 Mbit/s on the main path for 10s, recovery to 1109 Mbit/s |
-| Bond member split during `-P 8` | eno8303 2.22 GB, eno8403 2.12 GB |
+| Bond member split during `-P 8` | roughly half of the bytes on each member |
 
 ## Troubleshooting
 
@@ -175,9 +178,11 @@ Measured on glemmen160/170 with kernel WireGuard:
   addresses are routable between the nodes and that no firewall drops UDP
   between the path addresses. Probes use an ephemeral UDP port on the path
   address, not the WireGuard port.
-- Aggregation does not exceed one link: the two outer tuples are landing on
-  the same bond member. Verify with the member counters, then set
-  `NB_MULTIPATH_PORT_OFFSET` to a different value on one of the two nodes and
-  restart both, or try a different extra address.
+- Aggregation does not exceed one link: check the client log for the per-path
+  bond member line. A bond hash that ignores ports (for example a layer 2
+  policy) cannot be spread by moving path ports and is reported as such.
+- Placement measurements need real traffic: the log line appears a moment
+  after the path comes up. Without a WireGuard session on the path the burst
+  is not encrypted and the member cannot be measured.
 - Multipath is disabled with a firewall error: the active firewall backend
   cannot cover extra interfaces. Use nftables or disable the NetBird firewall.

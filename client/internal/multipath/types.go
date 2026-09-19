@@ -46,9 +46,12 @@ func (e PathEndpoint) String() string {
 
 // PathStatus is the observable state of one path.
 type PathStatus struct {
-	Local         PathEndpoint
-	Remote        PathEndpoint
-	Interface     string
+	Local     PathEndpoint
+	Remote    PathEndpoint
+	Interface string
+	// Member is the egress bond member the path was placed on, empty when the
+	// underlay is not a bond or placement could not measure it.
+	Member        string
 	State         PathState
 	TxBytes       int64
 	RxBytes       int64
@@ -72,10 +75,16 @@ type Config struct {
 	OverlayV4 netip.Prefix
 	// WgIface is the main WireGuard interface name.
 	WgIface string
-	// WgPort is the main WireGuard listen port. Path interfaces try to listen
-	// on WgPort+index so the outer tuples, and with them the bond member
-	// assignment, are reproducible across restarts.
+	// WgPort is the main WireGuard listen port. Path interfaces choose their
+	// listen ports from a range derived from this port.
 	WgPort int
+	// LocalOverlay is the local overlay IPv4 address. Path placement uses it
+	// as the source of the probe burst sent over the bond.
+	LocalOverlay netip.Addr
+	// OnPathsChanged is called with a peer key when path ports changed and
+	// the remote peer must be told about the new endpoints. It runs on a
+	// manager goroutine and must not block.
+	OnPathsChanged func(peerKey string)
 	// PrivateKey is the local WireGuard private key, shared by all path
 	// interfaces.
 	PrivateKey wgtypes.Key

@@ -27,17 +27,6 @@ const (
 	// NAT mappings do not expire.
 	keepaliveInterval = 25 * time.Second
 
-	// EnvMultipathPortOffset overrides the deterministic path port offset.
-	// The Linux bond hash is not portable, so a switch whose hash still maps
-	// both paths to one member can be worked around by shifting one end.
-	EnvMultipathPortOffset = "NB_MULTIPATH_PORT_OFFSET"
-
-	// pathPortOffsetHigh is added to the port range of the end with the
-	// lexicographically larger public key. The two ends use different offsets
-	// so the bond hash sees different source and destination ports; the value
-	// is chosen for the reference cluster and verified with member counters.
-	pathPortOffsetHigh = 37
-
 	hashPolicyPath = "/proc/sys/net/ipv4/fib_multipath_hash_policy"
 	// hashPolicyL4 makes the kernel hash the inner flow's 5-tuple, which is
 	// what spreads TCP flows over several paths.
@@ -82,30 +71,26 @@ func NewManager(cfg Config) (Manager, error) {
 		return nil, fmt.Errorf("multipath: find main interface %s: %w", cfg.WgIface, err)
 	}
 
-	portOffset := -1
-	if raw := os.Getenv(EnvMultipathPortOffset); raw != "" {
-		if value, err := strconv.Atoi(raw); err == nil && value >= 0 && value < 4096 {
-			portOffset = value
-		} else {
-			log.Warnf("ignoring invalid %s=%q", EnvMultipathPortOffset, raw)
-		}
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &linuxManager{
-		cfg:                cfg,
-		log:                log.WithField("component", "multipath"),
-		wg:                 wg,
-		ctx:                ctx,
-		cancel:             cancel,
-		peers:              make(map[string]*peerPaths),
-		mainIface:          mainLink.Attrs().Index,
-		extraAddrs:         normalizeAddrs(cfg.LocalAddresses),
-		ifaceDirty:         make(chan struct{}, 1),
-		localKey:           cfg.PrivateKey.PublicKey().String(),
-		portOffsetOverride: portOffset,
+		cfg:          cfg,
+		log:          log.WithField("component", "multipath"),
+		wg:           wg,
+		ctx:          ctx,
+		cancel:       cancel,
+		peers:        make(map[string]*peerPaths),
+		mainIface:    mainLink.Attrs().Index,
+		extraAddrs:   normalizeAddrs(cfg.LocalAddresses),
+		ifaceDirty:   make(chan struct{}, 1),
+		portsChanged: make(chan string, 8),
+		placementCh:  make(chan string, 64),
 	}
+	m.probe = &linuxProbe{m: m}
+	m.setDevicePort = m.setPort
+	m.placementPending = make(map[string]bool)
 	go m.observerLoop()
+	go m.notifyLoop()
+	go m.placementLoop()
 	return m, nil
 }
 
@@ -141,8 +126,15 @@ type linuxManager struct {
 	observer      func([]string)
 	observerState []string
 
-	localKey           string
-	portOffsetOverride int
+	// placement measures the bond member of each path and moves a path whose
+	// port lands on the same member as the main connection. It runs on a
+	// worker so an offer is never delayed by a measurement.
+	probe            placementProbe
+	setDevicePort    func(name string, port int) (int, error)
+	portsChanged     chan string
+	placementCh      chan string
+	placementMu      sync.Mutex
+	placementPending map[string]bool
 }
 
 type peerPaths struct {
@@ -150,6 +142,12 @@ type peerPaths struct {
 	allowedIPs []netip.Prefix
 	overlayIPs []netip.Addr
 	psk        *wgtypes.Key
+	// placedSig is the last placement input, so repeated offers do not rerun
+	// the measurement; placementRounds bounds re-rolls between two peers, and
+	// placementFailures bounds retries when a measurement keeps failing.
+	placedSig         string
+	placementRounds   int
+	placementFailures int
 
 	// extras are the path interfaces beyond the main connection, keyed by the
 	// path index in the advertised list.
@@ -167,6 +165,7 @@ type pathState struct {
 	linkIndex int
 	remote    PathEndpoint
 	state     PathState
+	member    string
 	prober    *prober
 	srcRoute  *netlink.Route
 }
@@ -260,6 +259,7 @@ func (m *linuxManager) Configure(peerKey string, remote []PathEndpoint, allowedI
 
 	m.applyRouteLocked(peer)
 	m.markInterfacesDirty()
+	m.schedulePlacementLocked(peer.key)
 	return nil
 }
 
@@ -383,6 +383,7 @@ func (m *linuxManager) PathStates(peerKey string) []PathStatus {
 			Local:     PathEndpoint{Addr: p.local, Port: p.port, ProbePort: p.probePort},
 			Remote:    p.remote,
 			Interface: p.name,
+			Member:    p.member,
 			State:     p.state,
 		})
 	}
@@ -552,11 +553,8 @@ func (m *linuxManager) configureDevice(name, peerKey string, idx int) error {
 		PrivateKey:   &m.cfg.PrivateKey,
 		ReplacePeers: true,
 	}
-	if m.cfg.WgPort > 0 {
-		port := m.cfg.WgPort + 1 + m.portOffset(peerKey) + int(peerHash(peerKey)%500)*maxPathIfaces + idx - 1
-		if port <= 65535 {
-			cfg.ListenPort = &port
-		}
+	if port := m.candidatePort(peerKey, idx, 0); port > 0 && port <= 65535 {
+		cfg.ListenPort = &port
 	}
 	if err := m.wg.ConfigureDevice(name, cfg); err != nil {
 		if cfg.ListenPort == nil {
@@ -571,18 +569,79 @@ func (m *linuxManager) configureDevice(name, peerKey string, idx int) error {
 	return nil
 }
 
-// portOffset returns the offset added to the deterministic path port range for
-// a peer. Both ends must use a different offset so the bond hash can spread the
-// path flows; the larger public key adds pathPortOffsetHigh, and the env var
-// overrides the choice for other hardware.
-func (m *linuxManager) portOffset(peerKey string) int {
-	if m.portOffsetOverride >= 0 {
-		return m.portOffsetOverride
+// setPort changes a path's WireGuard listen port and returns the port the
+// kernel bound.
+func (m *linuxManager) setPort(name string, port int) (int, error) {
+	value := port
+	if err := m.wg.ConfigureDevice(name, wgtypes.Config{ListenPort: &value}); err != nil {
+		return 0, err
 	}
-	if m.localKey > peerKey {
-		return pathPortOffsetHigh
+	dev, err := m.wg.Device(name)
+	if err != nil {
+		return 0, err
 	}
-	return 0
+	return dev.ListenPort, nil
+}
+
+// notifyLoop hands port changes to the peer connection, outside the manager
+// lock, so the remote peer can be told about the new endpoints.
+func (m *linuxManager) notifyLoop() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case key := <-m.portsChanged:
+			if m.cfg.OnPathsChanged != nil {
+				m.cfg.OnPathsChanged(key)
+			}
+		}
+	}
+}
+
+func (m *linuxManager) notifyPortsChangedLocked(peerKey string) {
+	select {
+	case m.portsChanged <- peerKey:
+	default:
+	}
+}
+
+// schedulePlacementLocked queues a peer for bond member placement, coalescing
+// repeated requests. Callers must hold m.mu.
+func (m *linuxManager) schedulePlacementLocked(peerKey string) {
+	m.placementMu.Lock()
+	defer m.placementMu.Unlock()
+
+	if m.placementPending[peerKey] {
+		return
+	}
+	m.placementPending[peerKey] = true
+	select {
+	case m.placementCh <- peerKey:
+	default:
+		// Queue full: drop the request, a later Configure retries it.
+		delete(m.placementPending, peerKey)
+	}
+}
+
+// placementLoop runs the bond member measurements one at a time. Slave
+// counters are shared by every path, so measurements must not overlap.
+func (m *linuxManager) placementLoop() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case key := <-m.placementCh:
+			m.placementMu.Lock()
+			delete(m.placementPending, key)
+			m.placementMu.Unlock()
+
+			m.mu.Lock()
+			if peer, ok := m.peers[key]; ok && !m.closed {
+				m.placeWithProbeLocked(peer, m.probe)
+			}
+			m.mu.Unlock()
+		}
+	}
 }
 
 // configurePathLocked points one path at its remote endpoint: a source route

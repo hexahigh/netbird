@@ -100,7 +100,7 @@ func init() {
 	upCmd.PersistentFlags().BoolVar(&multipathEnabled, multipathFlag, false, "[Experimental] Spread peer connections over several underlay paths. Requires kernel WireGuard on Linux and additional underlay addresses.")
 	upCmd.PersistentFlags().StringVar(&multipathMode, multipathModeFlag, "flow", "Multipath path selection mode: flow.")
 	upCmd.PersistentFlags().IntVar(&multipathMaxPaths, multipathMaxPathsFlag, 2, "Maximum number of paths per peer, including the main connection (2-8).")
-	upCmd.PersistentFlags().StringSliceVar(&multipathLocalAddresses, multipathAddressesFlag, nil, "Extra underlay IP addresses to bind paths to, e.g. --multipath-local-addresses 192.168.6.161,192.168.6.162. An empty string clears the list.")
+	upCmd.PersistentFlags().StringSliceVar(&multipathLocalAddresses, multipathAddressesFlag, nil, "Extra underlay IP addresses to bind paths to, e.g. --multipath-local-addresses 10.10.0.11,10.10.0.12. An empty string clears the list.")
 }
 
 func upFunc(cmd *cobra.Command, args []string) error {

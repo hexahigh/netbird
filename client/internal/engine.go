@@ -651,7 +651,9 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	}
 
 	if e.config.Multipath.Enabled && !e.wgInterface.IsUserspaceBind() {
-		manager, err := multipath.NewManager(e.config.Multipath)
+		multipathCfg := e.config.Multipath
+		multipathCfg.OnPathsChanged = e.refreshPeerPaths
+		manager, err := multipath.NewManager(multipathCfg)
 		if err != nil {
 			log.Errorf("multipath is enabled but cannot start: %v", err)
 		} else if manager == nil {
@@ -2081,6 +2083,17 @@ func (e *Engine) disableMultipath() {
 	}
 	e.multipathManager = nil
 	e.statusRecorder.SetPathProvider(nil)
+}
+
+// refreshPeerPaths asks a peer connection to send a fresh offer after the
+// multipath manager changed a path port, so the remote side updates the
+// endpoint it sends to.
+func (e *Engine) refreshPeerPaths(peerKey string) {
+	conn, ok := e.peerStore.PeerConn(peerKey)
+	if !ok {
+		return
+	}
+	conn.RefreshPaths()
 }
 
 // presharedKeyProvider exposes the Rosenpass-managed key of a peer to the

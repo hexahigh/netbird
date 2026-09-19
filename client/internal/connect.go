@@ -705,6 +705,7 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 		MaxPaths:       config.MultipathMaxPaths,
 		LocalAddresses: multipathAddrs,
 		OverlayV4:      wgAddr.Network,
+		LocalOverlay:   wgAddr.IP,
 		WgIface:        config.WgIface,
 		WgPort:         engineConf.WgPort,
 		PrivateKey:     key,

@@ -5,7 +5,7 @@ Status: accepted for the fork
 ## Context
 
 A single WireGuard UDP flow cannot use more than one member of an LACP bond.
-Measured on the glemmen cluster: a 2x1 Gbit layer 3+4 bond carries about
+Measured on a local test cluster: a 2x1 Gbit layer 3+4 bond carries about
 900 Mbit/s for a NetBird peer, while plain VXLAN spreads eight inner TCP flows
 across both members at about 1.8 Gbit/s. Aggregation requires several outer
 flows for the same peer plus a scheduler that assigns inner traffic to them.
@@ -73,13 +73,16 @@ path endpoints.
   path created after a rotation is seeded from the current key.
 - Interface count grows with peers times paths, so the path count is capped
   (default 2, maximum 8).
-- Two path tuples can still land on the same member because the bond hash is
-  not portable. Path listen ports are therefore deterministic, with a
-  key-order based offset so the two ends differ, and
-  `NB_MULTIPATH_PORT_OFFSET` shifts one end on hardware whose hash needs a
-  different placement. Operators verify member usage with the counters. A
-  runtime collision detector that re-rolls the port would remove the
-  per-topology tuning and is left as follow-up work.
+- The bond hash is not portable and a path tuple can land on the same member
+  as the main flow. Placement is measured at runtime instead of assumed: the
+  client steers a short burst through the path, reads the member counters,
+  and moves the path's listen port until it lands on a different member, then
+  re-advertises the endpoint. A hash policy that ignores ports cannot be
+  influenced this way; the client logs that case and keeps the connection on
+  the members the hash chooses.
 - The privileged lifecycle test covers path setup, promotion, demotion,
-  recovery, and teardown, but not the LAG member distribution, which depends
-  on the switch and is verified manually on the cluster.
+  recovery, and teardown. The placement loop is unit tested against a fake
+  probe (move, give up, skip non-bonds) and was validated on the reference
+  cluster by starting from colliding ports and watching the client spread
+  them without any tuning. A netns bond test with a real WireGuard session
+  would cover the measurement itself and is follow-up work.
