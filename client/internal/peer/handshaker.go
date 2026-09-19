@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -81,6 +82,13 @@ type Handshaker struct {
 	// When false, the local side skips ICE listener dispatch and suppresses ICE credentials in responses.
 	remoteICESupported atomic.Bool
 
+	// remoteMultipathKnown is set once an offer or answer has been received,
+	// and remoteMultipathSupported records whether it advertised the
+	// multipath feature. Until the first answer the local side advertises its
+	// own paths, so a capable peer learns about them immediately.
+	remoteMultipathKnown     atomic.Bool
+	remoteMultipathSupported atomic.Bool
+
 	// remoteOffersCh is a channel used to wait for remote credentials to proceed with the connection
 	remoteOffersCh chan OfferAnswer
 	// remoteAnswerCh is a channel used to wait for remote credentials answer (confirmation of our offer) to proceed with the connection
@@ -136,6 +144,7 @@ func (h *Handshaker) Listen(ctx context.Context) {
 			}
 
 			h.updateRemoteICEState(&remoteOfferAnswer)
+			h.updateRemoteMultipathState(&remoteOfferAnswer)
 
 			if h.relayListener != nil {
 				h.relayListener.Notify(&remoteOfferAnswer)
@@ -162,6 +171,7 @@ func (h *Handshaker) Listen(ctx context.Context) {
 			}
 
 			h.updateRemoteICEState(&remoteOfferAnswer)
+			h.updateRemoteMultipathState(&remoteOfferAnswer)
 
 			if h.relayListener != nil {
 				h.relayListener.Notify(&remoteOfferAnswer)
@@ -261,7 +271,7 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 		answer.RelaySrvIP = ip
 	}
 
-	if h.config.Multipath != nil {
+	if h.shouldAdvertiseMultipath() {
 		paths, err := h.config.Multipath.LocalPaths(h.config.Key)
 		if err != nil {
 			h.log.Warnf("multipath: local paths: %v", err)
@@ -272,6 +282,26 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 	}
 
 	return answer
+}
+
+// shouldAdvertiseMultipath reports whether local paths belong in an offer or
+// answer. Before the first remote offer or answer arrives the local side
+// advertises, so a capable peer can pick the paths up immediately; once the
+// remote is known not to support multipath the local side stops creating and
+// removing path interfaces on every offer.
+func (h *Handshaker) shouldAdvertiseMultipath() bool {
+	if h.config.Multipath == nil {
+		return false
+	}
+	return !h.remoteMultipathKnown.Load() || h.remoteMultipathSupported.Load()
+}
+
+func (h *Handshaker) updateRemoteMultipathState(offer *OfferAnswer) {
+	if h.config.Multipath == nil {
+		return
+	}
+	h.remoteMultipathKnown.Store(true)
+	h.remoteMultipathSupported.Store(slices.Contains(offer.Features, signalclient.Multipath))
 }
 
 func (h *Handshaker) updateRemoteICEState(offer *OfferAnswer) {

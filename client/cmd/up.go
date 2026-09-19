@@ -603,6 +603,7 @@ func validateMultipathFlags(cmd *cobra.Command) error {
 	if multipathMaxPaths < 2 || multipathMaxPaths > 8 {
 		return fmt.Errorf("multipath max paths must be between 2 and 8, got %d", multipathMaxPaths)
 	}
+	addresses := 0
 	for _, raw := range multipathLocalAddresses {
 		if raw == "" {
 			continue
@@ -610,6 +611,10 @@ func validateMultipathFlags(cmd *cobra.Command) error {
 		if _, err := netip.ParseAddr(raw); err != nil {
 			return fmt.Errorf("invalid multipath local address %q: %w", raw, err)
 		}
+		addresses++
+	}
+	if multipathEnabled && addresses == 0 {
+		return errors.New("--multipath requires at least one address in --multipath-local-addresses")
 	}
 	return nil
 }
