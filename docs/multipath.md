@@ -70,15 +70,23 @@ Each path runs a small UDP echo prober on a separate port. A path that misses
 three probes is removed from the route group; three successful probes put it
 back. The relay remains the fallback when every direct path is gone.
 
-Bond member placement is measured, not guessed. When a path is configured the
-client steers the peer's overlay traffic through the path, sends a short UDP
-burst, and reads the bond member counters to see which member carried it. If
-the path landed on the same member as the main connection, the client moves it
-to a different listen port and measures again, then tells the remote peer the
-new endpoint with a fresh offer. The measurement adapts to any bond hash
-policy, and it is skipped on underlays that are not bonds. The chosen member is
-logged per path and repeated offers with the same endpoints skip the
-measurement.
+Bond member placement is measured, not guessed, in both directions. When a
+path is configured the client steers the peer's overlay traffic through it,
+sends a short UDP burst, and reads the bond member transmit counters to see
+which member carried it. If the path landed on the same member as the main
+connection, the client moves it to a different listen port, measures again, and
+tells the remote peer the new endpoint with a fresh offer.
+
+Receive placement is separate because the switch chooses the member for traffic
+toward a host, not the host itself. While paths carry traffic, each side
+compares its member receive counters with the overlay bytes it received. When
+the peer's flows all arrive on one member, that side moves its own path port,
+which changes the destination port the peer sends to and with it the switch's
+choice, until the receive spreads.
+
+Both measurements adapt to any bond hash policy and are skipped on underlays
+that are not bonds. The chosen member is logged per path, and repeated offers
+with the same endpoints skip the measurement.
 
 ## Status and metrics
 

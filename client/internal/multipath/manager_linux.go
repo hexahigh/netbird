@@ -91,6 +91,7 @@ func NewManager(cfg Config) (Manager, error) {
 	go m.observerLoop()
 	go m.notifyLoop()
 	go m.placementLoop()
+	go m.ingressLoop()
 	return m, nil
 }
 
@@ -148,6 +149,7 @@ type peerPaths struct {
 	placedSig         string
 	placementRounds   int
 	placementFailures int
+	ingressRounds     int
 
 	// extras are the path interfaces beyond the main connection, keyed by the
 	// path index in the advertised list.
@@ -780,6 +782,13 @@ func (m *linuxManager) replaceRoute(overlay netip.Addr, devs []int) {
 	route := &netlink.Route{
 		Dst:       prefixToIPNet(netip.PrefixFrom(overlay, overlay.BitLen())),
 		MultiPath: nexthops,
+	}
+	// Pin the inner source to our overlay address. Without it the source is
+	// selected from the hash-selected nexthop's device, and a path interface
+	// has no address of its own, so locally generated flows could leave with
+	// an unrelated source address and be dropped by the peer.
+	if m.cfg.LocalOverlay.IsValid() && m.cfg.LocalOverlay.Is4() {
+		route.Src = m.cfg.LocalOverlay.AsSlice()
 	}
 	if err := netlink.RouteReplace(route); err != nil {
 		m.log.Errorf("install multipath route for %s: %v", overlay, err)

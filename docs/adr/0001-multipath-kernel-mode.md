@@ -74,12 +74,17 @@ path endpoints.
 - Interface count grows with peers times paths, so the path count is capped
   (default 2, maximum 8).
 - The bond hash is not portable and a path tuple can land on the same member
-  as the main flow. Placement is measured at runtime instead of assumed: the
-  client steers a short burst through the path, reads the member counters,
-  and moves the path's listen port until it lands on a different member, then
-  re-advertises the endpoint. A hash policy that ignores ports cannot be
-  influenced this way; the client logs that case and keeps the connection on
-  the members the hash chooses.
+  as the main flow. Placement is measured at runtime instead of assumed. On
+  the transmit side the client steers a short burst through the path, reads
+  the member counters, and moves the path's listen port until it lands on a
+  different member, then re-advertises the endpoint. On the receive side the
+  switch, not the host, chooses the member, so each side also watches its
+  member receive counters while paths carry traffic and moves its own port
+  when the peer's flows all arrive on one member. A hash policy that ignores
+  ports cannot be influenced this way; the client logs that case and keeps
+  the connection on the members the hash chooses.
+- Placement needs a WireGuard session and, for the receive side, traffic. It
+  is skipped until both exist and retried with a bound.
 - The privileged lifecycle test covers path setup, promotion, demotion,
   recovery, and teardown. The placement loop is unit tested against a fake
   probe (move, give up, skip non-bonds) and was validated on the reference
