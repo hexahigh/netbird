@@ -27,6 +27,17 @@ const (
 	// NAT mappings do not expire.
 	keepaliveInterval = 25 * time.Second
 
+	// EnvMultipathPortOffset overrides the deterministic path port offset.
+	// The Linux bond hash is not portable, so a switch whose hash still maps
+	// both paths to one member can be worked around by shifting one end.
+	EnvMultipathPortOffset = "NB_MULTIPATH_PORT_OFFSET"
+
+	// pathPortOffsetHigh is added to the port range of the end with the
+	// lexicographically larger public key. The two ends use different offsets
+	// so the bond hash sees different source and destination ports; the value
+	// is chosen for the reference cluster and verified with member counters.
+	pathPortOffsetHigh = 37
+
 	hashPolicyPath = "/proc/sys/net/ipv4/fib_multipath_hash_policy"
 	// hashPolicyL4 makes the kernel hash the inner flow's 5-tuple, which is
 	// what spreads TCP flows over several paths.
@@ -71,17 +82,28 @@ func NewManager(cfg Config) (Manager, error) {
 		return nil, fmt.Errorf("multipath: find main interface %s: %w", cfg.WgIface, err)
 	}
 
+	portOffset := -1
+	if raw := os.Getenv(EnvMultipathPortOffset); raw != "" {
+		if value, err := strconv.Atoi(raw); err == nil && value >= 0 && value < 4096 {
+			portOffset = value
+		} else {
+			log.Warnf("ignoring invalid %s=%q", EnvMultipathPortOffset, raw)
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &linuxManager{
-		cfg:        cfg,
-		log:        log.WithField("component", "multipath"),
-		wg:         wg,
-		ctx:        ctx,
-		cancel:     cancel,
-		peers:      make(map[string]*peerPaths),
-		mainIface:  mainLink.Attrs().Index,
-		extraAddrs: normalizeAddrs(cfg.LocalAddresses),
-		ifaceDirty: make(chan struct{}, 1),
+		cfg:                cfg,
+		log:                log.WithField("component", "multipath"),
+		wg:                 wg,
+		ctx:                ctx,
+		cancel:             cancel,
+		peers:              make(map[string]*peerPaths),
+		mainIface:          mainLink.Attrs().Index,
+		extraAddrs:         normalizeAddrs(cfg.LocalAddresses),
+		ifaceDirty:         make(chan struct{}, 1),
+		localKey:           cfg.PrivateKey.PublicKey().String(),
+		portOffsetOverride: portOffset,
 	}
 	go m.observerLoop()
 	return m, nil
@@ -118,6 +140,9 @@ type linuxManager struct {
 	observerMu    sync.Mutex
 	observer      func([]string)
 	observerState []string
+
+	localKey           string
+	portOffsetOverride int
 }
 
 type peerPaths struct {
@@ -483,12 +508,9 @@ func (m *linuxManager) createPathLocked(peer *peerPaths, idx int, local netip.Ad
 		return nil, fmt.Errorf("multipath: missing attributes for %s", name)
 	}
 
-	if err := m.wg.ConfigureDevice(name, wgtypes.Config{
-		PrivateKey:   &m.cfg.PrivateKey,
-		ReplacePeers: true,
-	}); err != nil {
+	if err := m.configureDevice(name, peer.key, idx); err != nil {
 		_ = netlink.LinkDel(link)
-		return nil, fmt.Errorf("multipath: configure %s: %w", name, err)
+		return nil, err
 	}
 	dev, err := m.wg.Device(name)
 	if err != nil {
@@ -519,6 +541,48 @@ func (m *linuxManager) createPathLocked(peer *peerPaths, idx int, local netip.Ad
 	}
 	p.prober = newProber(m.log.WithField("path", name), conn, m.ctx)
 	return p, nil
+}
+
+// configureDevice creates the WireGuard device of a path. The listen port is
+// derived from the peer key so it is stable across restarts and unique among
+// peers, which makes the outer tuple, and with it the bond member assignment,
+// reproducible. If the port is taken, fall back to a kernel-assigned one.
+func (m *linuxManager) configureDevice(name, peerKey string, idx int) error {
+	cfg := wgtypes.Config{
+		PrivateKey:   &m.cfg.PrivateKey,
+		ReplacePeers: true,
+	}
+	if m.cfg.WgPort > 0 {
+		port := m.cfg.WgPort + 1 + m.portOffset(peerKey) + int(peerHash(peerKey)%500)*maxPathIfaces + idx - 1
+		if port <= 65535 {
+			cfg.ListenPort = &port
+		}
+	}
+	if err := m.wg.ConfigureDevice(name, cfg); err != nil {
+		if cfg.ListenPort == nil {
+			return fmt.Errorf("multipath: configure %s: %w", name, err)
+		}
+		m.log.Warnf("port %d is not available for %s, using a random port: %v", *cfg.ListenPort, name, err)
+		cfg.ListenPort = nil
+		if err := m.wg.ConfigureDevice(name, cfg); err != nil {
+			return fmt.Errorf("multipath: configure %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// portOffset returns the offset added to the deterministic path port range for
+// a peer. Both ends must use a different offset so the bond hash can spread the
+// path flows; the larger public key adds pathPortOffsetHigh, and the env var
+// overrides the choice for other hardware.
+func (m *linuxManager) portOffset(peerKey string) int {
+	if m.portOffsetOverride >= 0 {
+		return m.portOffsetOverride
+	}
+	if m.localKey > peerKey {
+		return pathPortOffsetHigh
+	}
+	return 0
 }
 
 // configurePathLocked points one path at its remote endpoint: a source route
@@ -865,12 +929,18 @@ func udpPort(conn *net.UDPConn) (uint16, error) {
 }
 
 func pathIfaceName(peerKey string, idx int) string {
+	return fmt.Sprintf("%s%05x%d", pathIfacePrefix, peerHash(peerKey)&0xfffff, idx)
+}
+
+// peerHash is a stable hash of a peer key, used for interface names and
+// deterministic path ports.
+func peerHash(peerKey string) uint32 {
 	var h uint32 = 2166136261
 	for i := 0; i < len(peerKey); i++ {
 		h ^= uint32(peerKey[i])
 		h *= 16777619
 	}
-	return fmt.Sprintf("%s%05x%d", pathIfacePrefix, h&0xfffff, idx)
+	return h
 }
 
 func durationPtr(d time.Duration) *time.Duration {

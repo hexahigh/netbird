@@ -73,9 +73,13 @@ path endpoints.
   path created after a rotation is seeded from the current key.
 - Interface count grows with peers times paths, so the path count is capped
   (default 2, maximum 8).
-- On an address-based bond hash, two path address pairs can still land on the
-  same member. Address pairs must be chosen so the outer pairs hash apart;
-  the README documents verifying this with the member counters.
+- Two path tuples can still land on the same member because the bond hash is
+  not portable. Path listen ports are therefore deterministic, with a
+  key-order based offset so the two ends differ, and
+  `NB_MULTIPATH_PORT_OFFSET` shifts one end on hardware whose hash needs a
+  different placement. Operators verify member usage with the counters. A
+  runtime collision detector that re-rolls the port would remove the
+  per-topology tuning and is left as follow-up work.
 - The privileged lifecycle test covers path setup, promotion, demotion,
   recovery, and teardown, but not the LAG member distribution, which depends
   on the switch and is verified manually on the cluster.

@@ -70,6 +70,14 @@ Each path runs a small UDP echo prober on a separate port. A path that misses
 three probes is removed from the route group; three successful probes put it
 back. The relay remains the fallback when every direct path is gone.
 
+Path listen ports are derived from the main port, the peer key, and the side's
+own key, so the outer tuples, and with them the bond member assignment, are
+stable across restarts. The two ends use different offsets on purpose: a bond
+hash that includes ports needs distinct source and destination ports to spread
+the flows. On hardware where both paths still land on one member, shift one end
+with `NB_MULTIPATH_PORT_OFFSET` (an integer added to that side's port range)
+and verify the member counters.
+
 ## Status and metrics
 
 `netbird status --json` lists the paths of each peer:
@@ -167,8 +175,9 @@ Measured on glemmen160/170 with kernel WireGuard:
   addresses are routable between the nodes and that no firewall drops UDP
   between the path addresses. Probes use an ephemeral UDP port on the path
   address, not the WireGuard port.
-- Aggregation does not exceed one link: the two outer address pairs are
-  landing on the same bond member. Try different address pairs and verify with
-  the member counters.
+- Aggregation does not exceed one link: the two outer tuples are landing on
+  the same bond member. Verify with the member counters, then set
+  `NB_MULTIPATH_PORT_OFFSET` to a different value on one of the two nodes and
+  restart both, or try a different extra address.
 - Multipath is disabled with a firewall error: the active firewall backend
   cannot cover extra interfaces. Use nftables or disable the NetBird firewall.

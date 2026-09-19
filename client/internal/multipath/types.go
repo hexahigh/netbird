@@ -72,6 +72,10 @@ type Config struct {
 	OverlayV4 netip.Prefix
 	// WgIface is the main WireGuard interface name.
 	WgIface string
+	// WgPort is the main WireGuard listen port. Path interfaces try to listen
+	// on WgPort+index so the outer tuples, and with them the bond member
+	// assignment, are reproducible across restarts.
+	WgPort int
 	// PrivateKey is the local WireGuard private key, shared by all path
 	// interfaces.
 	PrivateKey wgtypes.Key
