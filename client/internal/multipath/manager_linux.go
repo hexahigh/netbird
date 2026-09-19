@@ -81,7 +81,9 @@ func NewManager(cfg Config) (Manager, error) {
 		peers:      make(map[string]*peerPaths),
 		mainIface:  mainLink.Attrs().Index,
 		extraAddrs: normalizeAddrs(cfg.LocalAddresses),
+		ifaceDirty: make(chan struct{}, 1),
 	}
+	go m.observerLoop()
 	return m, nil
 }
 
@@ -109,6 +111,13 @@ type linuxManager struct {
 	hashPolicyMu     sync.Mutex
 	hashPolicyOrig   int
 	hashPolicyChange bool
+
+	// ifaceDirty signals the observer loop that the set of path interfaces
+	// changed, so observers (the firewall) can be updated without holding m.mu.
+	ifaceDirty    chan struct{}
+	observerMu    sync.Mutex
+	observer      func([]string)
+	observerState []string
 }
 
 type peerPaths struct {
@@ -163,6 +172,7 @@ func (m *linuxManager) LocalPaths(peerKey string) ([]PathEndpoint, error) {
 		}
 		paths = append(paths, PathEndpoint{Addr: p.local, Port: p.port, ProbePort: p.probePort})
 	}
+	m.markInterfacesDirty()
 	return paths, nil
 }
 
@@ -194,6 +204,7 @@ func (m *linuxManager) Configure(peerKey string, remote []PathEndpoint, allowedI
 	if wanted == 0 {
 		m.removeExtrasLocked(peer)
 		m.clearRouteLocked(peer)
+		m.markInterfacesDirty()
 		return nil
 	}
 
@@ -223,6 +234,7 @@ func (m *linuxManager) Configure(peerKey string, remote []PathEndpoint, allowedI
 	}
 
 	m.applyRouteLocked(peer)
+	m.markInterfacesDirty()
 	return nil
 }
 
@@ -274,6 +286,58 @@ func (m *linuxManager) RemovePeer(peerKey string) {
 		m.destroyPath(p)
 	}
 	m.clearRoute(peer)
+	m.markInterfacesDirty()
+}
+
+// Interfaces returns the names of all active path interfaces.
+func (m *linuxManager) Interfaces() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.interfaceNamesLocked()
+}
+
+// SetInterfaceObserver registers a callback for path interface changes and
+// pushes the current state.
+func (m *linuxManager) SetInterfaceObserver(fn func([]string)) {
+	m.observerMu.Lock()
+	m.observer = fn
+	m.observerMu.Unlock()
+	m.markInterfacesDirty()
+}
+
+func (m *linuxManager) markInterfacesDirty() {
+	select {
+	case m.ifaceDirty <- struct{}{}:
+	default:
+	}
+}
+
+func (m *linuxManager) observerLoop() {
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.ifaceDirty:
+			m.observerMu.Lock()
+			fn := m.observer
+			m.observerMu.Unlock()
+			if fn != nil {
+				fn(m.Interfaces())
+			}
+		}
+	}
+}
+
+func (m *linuxManager) interfaceNamesLocked() []string {
+	var names []string
+	for _, peer := range m.peers {
+		for idx := 1; idx <= len(peer.extras); idx++ {
+			if p := peer.extras[idx]; p != nil {
+				names = append(names, p.name)
+			}
+		}
+	}
+	return names
 }
 
 // PathStates reports the current state of a peer's paths.

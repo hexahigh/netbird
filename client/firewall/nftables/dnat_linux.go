@@ -62,13 +62,7 @@ func (r *family) AddDNATRule(rule firewall.ForwardRule) (firewall.Rule, error) {
 }
 
 func (r *family) addDnatRedirect(rule firewall.ForwardRule, protoNum uint8, ruleID firewall.RuleID) error {
-	dnatExprs := []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpNeq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	dnatExprs := append(r.ifaceExprsInvert(expr.MetaKeyIIFNAME, true),
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 		&expr.Cmp{
 			Op:       expr.CmpOpEq,
@@ -81,7 +75,7 @@ func (r *family) addDnatRedirect(rule firewall.ForwardRule, protoNum uint8, rule
 			Offset:       2,
 			Len:          2,
 		},
-	}
+	)
 	portExprs, err := r.applyPort(&rule.DestinationPort, false)
 	if err != nil {
 		return fmt.Errorf("apply destination port: %w", err)
@@ -226,13 +220,7 @@ func (r *family) addDnatMasq(rule firewall.ForwardRule, protoNum uint8, ruleID f
 		return fmt.Errorf("apply translated port: %w", err)
 	}
 
-	masqExprs := []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	masqExprs := append(r.ifaceExprs(expr.MetaKeyOIFNAME),
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 		&expr.Cmp{
 			Op:       expr.CmpOpEq,
@@ -250,7 +238,7 @@ func (r *family) addDnatMasq(rule firewall.ForwardRule, protoNum uint8, ruleID f
 			Register: 1,
 			Data:     rule.TranslatedAddress.AsSlice(),
 		},
-	}
+	)
 
 	masqExprs = append(masqExprs, portExprs...)
 	masqExprs = append(masqExprs, &expr.Masq{})
@@ -347,13 +335,7 @@ func (r *family) AddInboundDNAT(localAddr netip.Addr, protocol firewall.Protocol
 		return fmt.Errorf("convert protocol to number: %w", err)
 	}
 
-	exprs := []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	exprs := append(r.ifaceExprs(expr.MetaKeyIIFNAME),
 		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 2},
 		&expr.Cmp{
 			Op:       expr.CmpOpEq,
@@ -371,7 +353,7 @@ func (r *family) AddInboundDNAT(localAddr netip.Addr, protocol firewall.Protocol
 			Register: 3,
 			Data:     binaryutil.BigEndian.PutUint16(originalPort),
 		},
-	}
+	)
 
 	bits := 32
 	if localAddr.Is6() {

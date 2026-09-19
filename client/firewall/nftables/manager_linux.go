@@ -125,6 +125,28 @@ func (m *Manager) Init(stateManager *statemanager.Manager) error {
 	return nil
 }
 
+// SetMultipathInterfaces updates the extra overlay interfaces the firewall
+// rules cover. An empty slice removes every path interface. It is part of the
+// multipath fail-closed contract: the engine only activates multipath when the
+// backend implements it.
+func (m *Manager) SetMultipathInterfaces(names []string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	var merr *multierror.Error
+	if m.family4 != nil {
+		if err := m.family4.setMultipathInterfaces(names); err != nil {
+			merr = multierror.Append(merr, fmt.Errorf("v4: %w", err))
+		}
+	}
+	if m.hasIPv6() {
+		if err := m.family6.setMultipathInterfaces(names); err != nil {
+			merr = multierror.Append(merr, fmt.Errorf("v6: %w", err))
+		}
+	}
+	return nberrors.FormatErrorOrNil(merr)
+}
+
 // reconcileExternalChains re-applies passthrough accept rules to external
 // filter chains for both IPv4 and IPv6 routers. Called by the monitor when
 // tables or chains appear (e.g. after firewalld reloads). Kernel routing opens

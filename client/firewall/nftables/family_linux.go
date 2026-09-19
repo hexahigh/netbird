@@ -3,11 +3,14 @@
 package nftables
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
+	"sync"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"github.com/hashicorp/go-multierror"
 	log "github.com/sirupsen/logrus"
 
@@ -100,6 +103,13 @@ type family struct {
 	ipFwdState       *ipfwdstate.IPForwardingState
 	legacyManagement bool
 	mtu              uint16
+
+	// ifaceSet holds the overlay interface names (main plus multipath paths)
+	// matched by the rules, so adding a path does not require re-rendering
+	// rules. Guarded by ifaceMu together with extraIfaces.
+	ifaceMu     sync.Mutex
+	ifaceSet    *nftables.Set
+	extraIfaces map[string]bool
 }
 
 func newFamily(workTable *nftables.Table, wgIface iFaceMapper, mtu uint16) *family {
@@ -130,8 +140,131 @@ func newFamily(workTable *nftables.Table, wgIface iFaceMapper, mtu uint16) *fami
 	return r
 }
 
+// ifaceSetName is the interface set every rule matches overlay interfaces
+// against. The set grows when multipath paths appear, so rules never need to
+// be re-rendered.
+const ifaceSetName = "netbird_ifaces"
+
+// createIfaceSet creates the interface set, seeded with the main interface.
+func (r *family) createIfaceSet() error {
+	r.ifaceMu.Lock()
+	defer r.ifaceMu.Unlock()
+
+	r.ifaceSet = &nftables.Set{
+		Name:    ifaceSetName,
+		Table:   r.workTable,
+		KeyType: nftables.TypeIFName,
+	}
+	r.extraIfaces = make(map[string]bool)
+	if err := r.conn.AddSet(r.ifaceSet, []nftables.SetElement{{Key: ifname(r.wgIface.Name())}}); err != nil {
+		return err
+	}
+	return r.conn.Flush()
+}
+
+// ifaceNames returns the main interface plus every active path interface.
+func (r *family) ifaceNames() []string {
+	r.ifaceMu.Lock()
+	defer r.ifaceMu.Unlock()
+
+	names := []string{r.wgIface.Name()}
+	for name := range r.extraIfaces {
+		names = append(names, name)
+	}
+	return names
+}
+
+// ifaceExprs matches a meta interface key against every overlay interface.
+func (r *family) ifaceExprs(key expr.MetaKey) []expr.Any {
+	return r.ifaceExprsInvert(key, false)
+}
+
+// ifaceExprsInvert matches a meta interface key, optionally negated.
+func (r *family) ifaceExprsInvert(key expr.MetaKey, invert bool) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: key, Register: 1},
+		&expr.Lookup{
+			SourceRegister: 1,
+			SetName:        r.ifaceSet.Name,
+			SetID:          r.ifaceSet.ID,
+			Invert:         invert,
+		},
+	}
+}
+
+// setMultipathInterfaces updates the path interfaces the rules match. The main
+// interface is always part of the set. Unknown interfaces are added to the set
+// and passed to firewalld first, so the rules cover the path from the moment
+// it carries traffic.
+func (r *family) setMultipathInterfaces(names []string) error {
+	r.ifaceMu.Lock()
+	defer r.ifaceMu.Unlock()
+
+	if r.ifaceSet == nil {
+		return errors.New("interface set is not initialized")
+	}
+
+	desired := make(map[string]bool, len(names))
+	for _, name := range names {
+		if name != "" && name != r.wgIface.Name() {
+			desired[name] = true
+		}
+	}
+
+	var add, remove []nftables.SetElement
+	var trust, untrust []string
+	for name := range desired {
+		if !r.extraIfaces[name] {
+			add = append(add, nftables.SetElement{Key: ifname(name)})
+			trust = append(trust, name)
+		}
+	}
+	for name := range r.extraIfaces {
+		if !desired[name] {
+			remove = append(remove, nftables.SetElement{Key: ifname(name)})
+			untrust = append(untrust, name)
+		}
+	}
+	if len(add) == 0 && len(remove) == 0 {
+		return nil
+	}
+
+	for _, name := range trust {
+		if err := firewalld.TrustInterface(name); err != nil {
+			log.Warnf("failed to trust interface %s in firewalld: %v", name, err)
+		}
+	}
+	if len(add) > 0 {
+		if err := r.conn.SetAddElements(r.ifaceSet, add); err != nil {
+			return fmt.Errorf("add path interfaces: %w", err)
+		}
+	}
+	if len(remove) > 0 {
+		if err := r.conn.SetDeleteElements(r.ifaceSet, remove); err != nil {
+			return fmt.Errorf("remove path interfaces: %w", err)
+		}
+	}
+	if err := r.conn.Flush(); err != nil {
+		return fmt.Errorf("flush interface set: %w", err)
+	}
+
+	for _, name := range untrust {
+		if err := firewalld.UntrustInterface(name); err != nil {
+			log.Warnf("failed to untrust interface %s in firewalld: %v", name, err)
+		}
+	}
+
+	r.extraIfaces = desired
+	log.Infof("firewall covers path interfaces %v", names)
+	return nil
+}
+
 func (r *family) init(workTable *nftables.Table) error {
 	r.workTable = workTable
+
+	if err := r.createIfaceSet(); err != nil {
+		return fmt.Errorf("create interface set: %w", err)
+	}
 
 	if err := r.removeAcceptFilterRules(); err != nil {
 		log.Errorf("failed to clean up rules from filter table: %s", err)

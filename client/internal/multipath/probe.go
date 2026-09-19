@@ -33,7 +33,7 @@ var probeMagic = [4]byte{'N', 'B', 'M', 'P'}
 // socket receives the remote's probes and echoes them, so a path is
 // considered up only when traffic passes in both directions.
 type prober struct {
-	log  *log.Entry
+	log    *log.Entry
 	conn   *net.UDPConn
 	ctx    context.Context
 	cancel context.CancelFunc

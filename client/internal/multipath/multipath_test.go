@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	log "github.com/sirupsen/logrus"
 )
 
 func TestNormalizeAddrs(t *testing.T) {

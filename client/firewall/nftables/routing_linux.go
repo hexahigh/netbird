@@ -106,22 +106,7 @@ func (r *family) natRuleExprs(pair firewall.RouterPair) ([]expr.Any, error) {
 		return nil, fmt.Errorf("apply destination: %w", err)
 	}
 
-	op := expr.CmpOpEq
-	if pair.Inverse {
-		op = expr.CmpOpNeq
-	}
-
-	exprs := []expr.Any{
-		&expr.Meta{
-			Key:      expr.MetaKeyIIFNAME,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       op,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
-	}
+	exprs := r.ifaceExprsInvert(expr.MetaKeyIIFNAME, pair.Inverse)
 	// We only care about NEW connections to mark them and later identify them in the postrouting chain for masquerading.
 	// Masquerading will take care of the conntrack state, which means we won't need to mark established connections.
 	exprs = append(exprs, getCtNewExprs()...)
@@ -224,20 +209,13 @@ func (r *family) addPostroutingRules() {
 			Register: 1,
 			Data:     binaryutil.NativeEndian.PutUint32(nbnet.PreroutingFwmarkMasqueradeReturn),
 		},
-
-		// Match WireGuard interface
-		&expr.Meta{
-			Key:      expr.MetaKeyOIFNAME,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	}
+	// Match WireGuard interfaces
+	exprs2 = append(exprs2, r.ifaceExprs(expr.MetaKeyOIFNAME)...)
+	exprs2 = append(exprs2,
 		&expr.Counter{},
 		&expr.Masq{},
-	}
+	)
 
 	r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,
@@ -258,16 +236,7 @@ func (r *family) addMSSClampingRules() error {
 	}
 	mss := r.mtu - overhead
 
-	exprsOut := []expr.Any{
-		&expr.Meta{
-			Key:      expr.MetaKeyOIFNAME,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	exprsOut := append(r.ifaceExprs(expr.MetaKeyOIFNAME),
 		&expr.Meta{
 			Key:      expr.MetaKeyL4PROTO,
 			Register: 1,
@@ -319,7 +288,7 @@ func (r *family) addMSSClampingRules() error {
 			Len:            2,
 			Op:             expr.ExthdrOpTcpopt,
 		},
-	}
+	)
 
 	r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,

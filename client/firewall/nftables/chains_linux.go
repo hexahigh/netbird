@@ -106,17 +106,7 @@ func (r *family) setupDataPlaneMark() error {
 	}
 
 	ctNew := getCtNewExprs()
-	preExprs := []expr.Any{
-		&expr.Meta{
-			Key:      expr.MetaKeyIIFNAME,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
-	}
+	preExprs := r.ifaceExprs(expr.MetaKeyIIFNAME)
 	preExprs = append(preExprs, ctNew...)
 	preExprs = append(preExprs,
 		&expr.Immediate{
@@ -137,17 +127,7 @@ func (r *family) setupDataPlaneMark() error {
 	}
 	r.conn.AddRule(preNftRule)
 
-	postExprs := []expr.Any{
-		&expr.Meta{
-			Key:      expr.MetaKeyOIFNAME,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
-	}
+	postExprs := r.ifaceExprs(expr.MetaKeyOIFNAME)
 	postExprs = append(postExprs, ctNew...)
 	postExprs = append(postExprs,
 		&expr.Immediate{
@@ -236,33 +216,41 @@ func (r *family) acceptFilterRulesIptables(ipt *iptables.IPTables, includeForwar
 		}
 	}
 
-	inputRule := r.getAcceptInputRule()
-	if err := ipt.Insert("filter", chainNameInput, 1, inputRule...); err != nil {
-		merr = multierror.Append(merr, fmt.Errorf("add iptables input rule: %v", err))
-	} else {
-		log.Debugf("added iptables input rule: %v", inputRule)
+	for _, inputRule := range r.getAcceptInputRules() {
+		if err := ipt.Insert("filter", chainNameInput, 1, inputRule...); err != nil {
+			merr = multierror.Append(merr, fmt.Errorf("add iptables input rule: %v", err))
+		} else {
+			log.Debugf("added iptables input rule: %v", inputRule)
+		}
 	}
 
 	return nberrors.FormatErrorOrNil(merr)
 }
 
+// getAcceptForwardRules returns one accept rule pair per overlay interface,
+// covering the main connection and every multipath path.
 func (r *family) getAcceptForwardRules() [][]string {
-	intf := r.wgIface.Name()
-	return [][]string{
-		{"-i", intf, "-j", "ACCEPT"},
-		{"-o", intf, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+	var rules [][]string
+	for _, intf := range r.ifaceNames() {
+		rules = append(rules,
+			[]string{"-i", intf, "-j", "ACCEPT"},
+			[]string{"-o", intf, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"},
+		)
 	}
+	return rules
 }
 
-func (r *family) getAcceptInputRule() []string {
-	return []string{"-i", r.wgIface.Name(), "-j", "ACCEPT"}
+func (r *family) getAcceptInputRules() [][]string {
+	var rules [][]string
+	for _, intf := range r.ifaceNames() {
+		rules = append(rules, []string{"-i", intf, "-j", "ACCEPT"})
+	}
+	return rules
 }
 
 // acceptFilterRulesNftables adds accept rules to the ip filter table using nftables.
 // This is used when iptables is not available.
 func (r *family) acceptFilterRulesNftables(table *nftables.Table, includeForward bool) error {
-	intf := ifname(r.wgIface.Name())
-
 	if includeForward {
 		forwardChain := &nftables.Chain{
 			Name:     chainNameForward,
@@ -271,7 +259,7 @@ func (r *family) acceptFilterRulesNftables(table *nftables.Table, includeForward
 			Hooknum:  nftables.ChainHookForward,
 			Priority: nftables.ChainPriorityFilter,
 		}
-		r.insertForwardAcceptRules(forwardChain, intf)
+		r.insertForwardAcceptRules(forwardChain)
 	}
 
 	inputChain := &nftables.Chain{
@@ -281,7 +269,7 @@ func (r *family) acceptFilterRulesNftables(table *nftables.Table, includeForward
 		Hooknum:  nftables.ChainHookInput,
 		Priority: nftables.ChainPriorityFilter,
 	}
-	r.insertInputAcceptRule(inputChain, intf)
+	r.insertInputAcceptRule(inputChain)
 
 	return r.conn.Flush()
 }
@@ -294,9 +282,8 @@ func (r *family) acceptExternalChainsRules(includeForward bool) error {
 		return nil
 	}
 
-	intf := ifname(r.wgIface.Name())
 	for _, chain := range chains {
-		r.applyExternalChainAccept(chain, intf, includeForward)
+		r.applyExternalChainAccept(chain, includeForward)
 	}
 
 	if err := r.conn.Flush(); err != nil {
@@ -305,7 +292,7 @@ func (r *family) acceptExternalChainsRules(includeForward bool) error {
 	return nil
 }
 
-func (r *family) applyExternalChainAccept(chain *nftables.Chain, intf []byte, includeForward bool) {
+func (r *family) applyExternalChainAccept(chain *nftables.Chain, includeForward bool) {
 	if chain.Hooknum == nil {
 		log.Debugf("skipping external chain %s/%s: hooknum is nil", chain.Table.Name, chain.Name)
 		return
@@ -317,48 +304,44 @@ func (r *family) applyExternalChainAccept(chain *nftables.Chain, intf []byte, in
 	switch *chain.Hooknum {
 	case *nftables.ChainHookForward:
 		if includeForward {
-			r.insertForwardAcceptRules(chain, intf)
+			r.insertForwardAcceptRules(chain)
 		}
 	case *nftables.ChainHookInput:
-		r.insertInputAcceptRule(chain, intf)
+		r.insertInputAcceptRule(chain)
 	}
 }
 
-func (r *family) insertForwardAcceptRules(chain *nftables.Chain, intf []byte) {
+func (r *family) insertForwardAcceptRules(chain *nftables.Chain) {
 	existing, err := r.existingNetbirdRulesInChain(chain)
 	if err != nil {
 		log.Warnf("skip forward accept rules in %s/%s: %v", chain.Table.Name, chain.Name, err)
 		return
 	}
-	r.insertForwardIifRule(chain, intf, existing)
-	r.insertForwardOifEstablishedRule(chain, intf, existing)
+	r.insertForwardIifRule(chain, existing)
+	r.insertForwardOifEstablishedRule(chain, existing)
 }
 
-func (r *family) insertForwardIifRule(chain *nftables.Chain, intf []byte, existing map[string]bool) {
+func (r *family) insertForwardIifRule(chain *nftables.Chain, existing map[string]bool) {
 	if existing[userDataAcceptForwardRuleIif] {
 		return
 	}
+	exprs := append(r.ifaceExprs(expr.MetaKeyIIFNAME),
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	)
 	r.conn.InsertRule(&nftables.Rule{
-		Table: chain.Table,
-		Chain: chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: intf},
-			&expr.Counter{},
-			&expr.Verdict{Kind: expr.VerdictAccept},
-		},
+		Table:    chain.Table,
+		Chain:    chain,
+		Exprs:    exprs,
 		UserData: []byte(userDataAcceptForwardRuleIif),
 	})
 }
 
-func (r *family) insertForwardOifEstablishedRule(chain *nftables.Chain, intf []byte, existing map[string]bool) {
+func (r *family) insertForwardOifEstablishedRule(chain *nftables.Chain, existing map[string]bool) {
 	if existing[userDataAcceptForwardRuleOif] {
 		return
 	}
-	exprs := []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: intf},
-	}
+	exprs := r.ifaceExprs(expr.MetaKeyOIFNAME)
 	r.conn.InsertRule(&nftables.Rule{
 		Table:    chain.Table,
 		Chain:    chain,
@@ -367,7 +350,7 @@ func (r *family) insertForwardOifEstablishedRule(chain *nftables.Chain, intf []b
 	})
 }
 
-func (r *family) insertInputAcceptRule(chain *nftables.Chain, intf []byte) {
+func (r *family) insertInputAcceptRule(chain *nftables.Chain) {
 	existing, err := r.existingNetbirdRulesInChain(chain)
 	if err != nil {
 		log.Warnf("skip input accept rule in %s/%s: %v", chain.Table.Name, chain.Name, err)
@@ -376,15 +359,14 @@ func (r *family) insertInputAcceptRule(chain *nftables.Chain, intf []byte) {
 	if existing[userDataAcceptInputRule] {
 		return
 	}
+	exprs := append(r.ifaceExprs(expr.MetaKeyIIFNAME),
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	)
 	r.conn.InsertRule(&nftables.Rule{
-		Table: chain.Table,
-		Chain: chain,
-		Exprs: []expr.Any{
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: intf},
-			&expr.Counter{},
-			&expr.Verdict{Kind: expr.VerdictAccept},
-		},
+		Table:    chain.Table,
+		Chain:    chain,
+		Exprs:    exprs,
 		UserData: []byte(userDataAcceptInputRule),
 	})
 }
@@ -580,9 +562,10 @@ func (r *family) removeAcceptFilterRulesIptables(ipt *iptables.IPTables) error {
 		}
 	}
 
-	inputRule := r.getAcceptInputRule()
-	if err := ipt.DeleteIfExists("filter", chainNameInput, inputRule...); err != nil {
-		merr = multierror.Append(merr, fmt.Errorf("remove iptables input rule: %v", err))
+	for _, inputRule := range r.getAcceptInputRules() {
+		if err := ipt.DeleteIfExists("filter", chainNameInput, inputRule...); err != nil {
+			merr = multierror.Append(merr, fmt.Errorf("remove iptables input rule: %v", err))
+		}
 	}
 
 	return nberrors.FormatErrorOrNil(merr)
@@ -620,17 +603,7 @@ func (r *family) queuePreroutingRule(expressions []expr.Any, userData []byte) *n
 	preroutingExprs := slices.Clone(expressions)
 
 	// interface
-	preroutingExprs = append([]expr.Any{
-		&expr.Meta{
-			Key:      expr.MetaKeyIIFNAME,
-			Register: 1,
-		},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
-	}, preroutingExprs...)
+	preroutingExprs = append(r.ifaceExprs(expr.MetaKeyIIFNAME), preroutingExprs...)
 
 	// local destination and mark
 	preroutingExprs = append(preroutingExprs,
@@ -740,18 +713,12 @@ func (r *family) addFwmarkToForward(chainFwFilter *nftables.Chain) {
 }
 
 func (r *family) addJumpRulesToRtForward(chainFwFilter *nftables.Chain) {
-	expressions := []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	expressions := append(r.ifaceExprs(expr.MetaKeyIIFNAME),
 		&expr.Verdict{
 			Kind:  expr.VerdictJump,
 			Chain: r.routingFwChainName,
 		},
-	}
+	)
 
 	_ = r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,
@@ -788,15 +755,9 @@ func (r *family) createFilterChainWithHook(name string, hookNum *nftables.ChainH
 }
 
 func (r *family) addDropExpressions(chain *nftables.Chain, ifaceKey expr.MetaKey) []expr.Any {
-	expressions := []expr.Any{
-		&expr.Meta{Key: ifaceKey, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	expressions := append(r.ifaceExprs(ifaceKey),
 		&expr.Verdict{Kind: expr.VerdictDrop},
-	}
+	)
 	_ = r.conn.AddRule(&nftables.Rule{
 		Table: r.workTable,
 		Chain: chain,
@@ -806,18 +767,12 @@ func (r *family) addDropExpressions(chain *nftables.Chain, ifaceKey expr.MetaKey
 }
 
 func (r *family) addJumpRule(chain *nftables.Chain, to string, ifaceKey expr.MetaKey) {
-	expressions := []expr.Any{
-		&expr.Meta{Key: ifaceKey, Register: 1},
-		&expr.Cmp{
-			Op:       expr.CmpOpEq,
-			Register: 1,
-			Data:     ifname(r.wgIface.Name()),
-		},
+	expressions := append(r.ifaceExprs(ifaceKey),
 		&expr.Verdict{
 			Kind:  expr.VerdictJump,
 			Chain: to,
 		},
-	}
+	)
 
 	_ = r.conn.AddRule(&nftables.Rule{
 		Table: chain.Table,

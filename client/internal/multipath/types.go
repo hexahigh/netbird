@@ -99,4 +99,12 @@ type Manager interface {
 
 	// PathStates returns the current path status of a peer.
 	PathStates(peerKey string) []PathStatus
+
+	// Interfaces returns the names of all active path interfaces.
+	Interfaces() []string
+
+	// SetInterfaceObserver registers a callback invoked with the current path
+	// interface names whenever they change. It must be called before paths
+	// appear; the callback replaces any previous one.
+	SetInterfaceObserver(func(names []string))
 }

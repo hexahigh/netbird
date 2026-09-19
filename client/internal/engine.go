@@ -44,8 +44,8 @@ import (
 	"github.com/netbirdio/netbird/client/internal/expose"
 	"github.com/netbirdio/netbird/client/internal/ingressgw"
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
-	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/metrics"
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/netflow"
 	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
 	"github.com/netbirdio/netbird/client/internal/networkmonitor"
@@ -664,6 +664,8 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 	if err := e.createFirewall(); err != nil {
 		return err
 	}
+
+	e.bindMultipathFirewall()
 
 	// Inject firewall into DNS server now that it's available.
 	// The DNS server is created before the firewall because the route manager
@@ -2028,6 +2030,53 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 	}
 
 	return peerConn, nil
+}
+
+// multipathFirewall is implemented by firewall backends that can cover extra
+// overlay interfaces.
+type multipathFirewall interface {
+	SetMultipathInterfaces(names []string) error
+}
+
+// bindMultipathFirewall makes the firewall cover path interfaces as they
+// appear, and disables multipath when the active backend cannot. Extra path
+// interfaces carry the same peer traffic as the main interface, so a backend
+// that does not know about them would fail open on every ACL matched by
+// ingress interface.
+func (e *Engine) bindMultipathFirewall() {
+	if e.multipathManager == nil || e.firewall == nil {
+		return
+	}
+
+	fw, ok := e.firewall.(multipathFirewall)
+	if !ok {
+		log.Errorf("multipath disabled: firewall backend %T cannot cover extra interfaces", e.firewall)
+		e.disableMultipath()
+		return
+	}
+	if err := fw.SetMultipathInterfaces(e.multipathManager.Interfaces()); err != nil {
+		log.Errorf("multipath disabled: firewall cannot cover extra interfaces: %v", err)
+		e.disableMultipath()
+		return
+	}
+	e.multipathManager.SetInterfaceObserver(func(names []string) {
+		if err := fw.SetMultipathInterfaces(names); err != nil {
+			log.Errorf("failed to update path interfaces in the firewall: %v", err)
+		}
+	})
+}
+
+// disableMultipath stops the manager and clears it, so peers opened afterwards
+// fall back to the main connection. Peers already open are rebuilt on the next
+// network map update.
+func (e *Engine) disableMultipath() {
+	if e.multipathManager == nil {
+		return
+	}
+	if err := e.multipathManager.Close(); err != nil {
+		log.Warnf("failed to stop multipath manager: %v", err)
+	}
+	e.multipathManager = nil
 }
 
 // presharedKeyProvider exposes the Rosenpass-managed key of a peer to the
