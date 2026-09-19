@@ -5,6 +5,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	signal "github.com/netbirdio/netbird/shared/signal/client"
 	sProto "github.com/netbirdio/netbird/shared/signal/proto"
 )
@@ -27,6 +28,22 @@ func (s *Signaler) SignalOffer(offer OfferAnswer, remoteKey string) error {
 
 func (s *Signaler) SignalAnswer(offer OfferAnswer, remoteKey string) error {
 	return s.signalOfferAnswer(offer, remoteKey, sProto.Body_ANSWER)
+}
+
+// toSignalPaths converts multipath endpoints to the signal wire type.
+func toSignalPaths(paths []multipath.PathEndpoint) []signal.PathEndpoint {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]signal.PathEndpoint, 0, len(paths))
+	for _, p := range paths {
+		out = append(out, signal.PathEndpoint{
+			IP:        p.Addr,
+			Port:      p.Port,
+			ProbePort: p.ProbePort,
+		})
+	}
+	return out
 }
 
 func (s *Signaler) SignalICECandidate(candidate ice.Candidate, remoteKey string) error {
@@ -66,6 +83,8 @@ func (s *Signaler) signalOfferAnswer(offerAnswer OfferAnswer, remoteKey string, 
 		RelaySrvAddress: offerAnswer.RelaySrvAddress,
 		RelaySrvIP:      offerAnswer.RelaySrvIP,
 		SessionID:       sessionIDBytes,
+		Features:        offerAnswer.Features,
+		MultipathPaths:  toSignalPaths(offerAnswer.MultipathPaths),
 	})
 	if err != nil {
 		return err

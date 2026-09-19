@@ -103,6 +103,11 @@ type ConfigInput struct {
 
 	LocalMetricsEnabled *bool
 	LocalMetricsAddress *string
+
+	Multipath               *bool
+	MultipathMode           *string
+	MultipathMaxPaths       *int
+	MultipathLocalAddresses []string
 }
 
 // Config Configuration type
@@ -149,6 +154,18 @@ type Config struct {
 	LocalMetricsEnabled bool
 	// LocalMetricsAddress is the listen address of the local /metrics endpoint.
 	LocalMetricsAddress string
+
+	// Multipath spreads a peer connection over extra underlay paths (Linux
+	// kernel WireGuard only).
+	Multipath bool
+	// MultipathMode is the path selection mode, "flow" or "rr". Kernel mode
+	// supports flow only.
+	MultipathMode string
+	// MultipathMaxPaths is the total number of paths per peer, including the
+	// main connection.
+	MultipathMaxPaths int
+	// MultipathLocalAddresses are the extra underlay addresses paths bind to.
+	MultipathLocalAddresses []string
 
 	// SSHKey is a private SSH key in a PEM format
 	SSHKey string
@@ -443,6 +460,30 @@ func (config *Config) apply(input ConfigInput) (updated bool, err error) {
 		updated = true
 	}
 
+	if input.Multipath != nil && *input.Multipath != config.Multipath {
+		log.Infof("switching multipath to %t", *input.Multipath)
+		config.Multipath = *input.Multipath
+		updated = true
+	}
+
+	if input.MultipathMode != nil && *input.MultipathMode != config.MultipathMode {
+		log.Infof("switching multipath mode to %s", *input.MultipathMode)
+		config.MultipathMode = *input.MultipathMode
+		updated = true
+	}
+
+	if input.MultipathMaxPaths != nil && *input.MultipathMaxPaths != config.MultipathMaxPaths {
+		log.Infof("switching multipath max paths to %d", *input.MultipathMaxPaths)
+		config.MultipathMaxPaths = *input.MultipathMaxPaths
+		updated = true
+	}
+
+	if input.MultipathLocalAddresses != nil && !slices.Equal(config.MultipathLocalAddresses, input.MultipathLocalAddresses) {
+		log.Infof("switching multipath local addresses to %v", input.MultipathLocalAddresses)
+		config.MultipathLocalAddresses = input.MultipathLocalAddresses
+		updated = true
+	}
+
 	if input.NetworkMonitor != nil && (config.NetworkMonitor == nil || *input.NetworkMonitor != *config.NetworkMonitor) {
 		log.Infof("switching Network Monitor to %t", *input.NetworkMonitor)
 		config.NetworkMonitor = input.NetworkMonitor
@@ -717,6 +758,15 @@ func (config *Config) apply(input ConfigInput) (updated bool, err error) {
 	} else if config.MTU == 0 {
 		config.MTU = iface.DefaultMTU
 		log.Infof("using default MTU %d", config.MTU)
+		updated = true
+	}
+
+	if config.MultipathMode == "" {
+		config.MultipathMode = "flow"
+		updated = true
+	}
+	if config.MultipathMaxPaths == 0 {
+		config.MultipathMaxPaths = 2
 		updated = true
 	}
 

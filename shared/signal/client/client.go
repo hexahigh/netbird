@@ -21,6 +21,8 @@ const (
 
 	// DirectCheck indicates support to direct mode checks
 	DirectCheck uint32 = 1
+	// Multipath indicates support for extra underlay paths per peer.
+	Multipath uint32 = 2
 )
 
 // Status is the status of the client
@@ -45,6 +47,13 @@ type Credential struct {
 	Pwd   string
 }
 
+// PathEndpoint is one extra underlay path advertised to the remote peer.
+type PathEndpoint struct {
+	IP        netip.Addr
+	Port      uint16
+	ProbePort uint16
+}
+
 // CredentialPayload bundles the fields of a signal Body for MarshalCredential.
 type CredentialPayload struct {
 	Type            proto.Body_Type
@@ -55,6 +64,8 @@ type CredentialPayload struct {
 	RelaySrvAddress string
 	RelaySrvIP      netip.Addr
 	SessionID       []byte
+	Features        []uint32
+	MultipathPaths  []PathEndpoint
 }
 
 // UnMarshalCredential parses the credentials from the message and returns a Credential instance
@@ -81,7 +92,18 @@ func MarshalCredential(myKey wgtypes.Key, remoteKey string, p CredentialPayload)
 			RosenpassPubKey:     p.RosenpassPubKey,
 			RosenpassServerAddr: p.RosenpassAddr,
 		},
-		SessionId: p.SessionID,
+		SessionId:         p.SessionID,
+		FeaturesSupported: p.Features,
+	}
+	for _, ep := range p.MultipathPaths {
+		if !ep.IP.IsValid() || ep.Port == 0 {
+			continue
+		}
+		body.MultipathPaths = append(body.MultipathPaths, &proto.PathEndpoint{
+			Ip:        ep.IP.AsSlice(),
+			Port:      uint32(ep.Port),
+			ProbePort: uint32(ep.ProbePort),
+		})
 	}
 	if p.RelaySrvAddress != "" {
 		body.RelayServerAddress = &p.RelaySrvAddress

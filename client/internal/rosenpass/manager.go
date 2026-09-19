@@ -292,6 +292,20 @@ func (m *Manager) OnConnected(remoteWireGuardKey string, remoteRosenpassPubKey [
 	}
 }
 
+// CurrentPresharedKey returns the preshared key currently programmed for a
+// WireGuard peer. Before the first exchange completes it returns the
+// rendezvous key, so extra paths can be configured before Rosenpass finishes.
+func (m *Manager) CurrentPresharedKey(wireGuardPubKey string) (wgtypes.Key, bool) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	peerID, ok := m.rpPeerIDs[wireGuardPubKey]
+	if !ok || peerID == nil || m.rpWgHandler == nil {
+		return wgtypes.Key{}, false
+	}
+	return m.rpWgHandler.CurrentPresharedKey(*peerID)
+}
+
 // IsPresharedKeyInitialized returns true if Rosenpass has completed a handshake
 // and set a PSK for the given WireGuard peer.
 func (m *Manager) IsPresharedKeyInitialized(wireGuardPubKey string) bool {

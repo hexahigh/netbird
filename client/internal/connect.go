@@ -30,6 +30,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
 	"github.com/netbirdio/netbird/client/internal/listener"
 	"github.com/netbirdio/netbird/client/internal/metrics"
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
 	"github.com/netbirdio/netbird/client/internal/statemanager"
@@ -694,7 +695,44 @@ func createEngineConfig(key wgtypes.Key, config *profilemanager.Config, peerConf
 	}
 	engineConf.WgPort = port
 
+	multipathAddrs, err := parseMultipathAddresses(config)
+	if err != nil {
+		return nil, err
+	}
+	engineConf.Multipath = multipath.Config{
+		Enabled:        config.Multipath,
+		Mode:           config.MultipathMode,
+		MaxPaths:       config.MultipathMaxPaths,
+		LocalAddresses: multipathAddrs,
+		OverlayV4:      wgAddr.Network,
+		WgIface:        config.WgIface,
+		PrivateKey:     key,
+		MTU:            engineConf.MTU,
+	}
+
 	return engineConf, nil
+}
+
+// parseMultipathAddresses validates the configured extra path addresses.
+func parseMultipathAddresses(config *profilemanager.Config) ([]netip.Addr, error) {
+	if !config.Multipath {
+		return nil, nil
+	}
+	addrs := make([]netip.Addr, 0, len(config.MultipathLocalAddresses))
+	for _, raw := range config.MultipathLocalAddresses {
+		if raw == "" {
+			continue
+		}
+		addr, err := netip.ParseAddr(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse multipath local address %q: %w", raw, err)
+		}
+		addrs = append(addrs, addr.Unmap())
+	}
+	if len(addrs) == 0 {
+		return nil, errors.New("multipath requires at least one local address in multipath-local-addresses")
+	}
+	return addrs, nil
 }
 
 func selectMTU(localMTU uint16, peerMTU int32) uint16 {

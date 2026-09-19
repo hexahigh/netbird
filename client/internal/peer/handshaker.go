@@ -9,6 +9,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/netbirdio/netbird/client/internal/multipath"
+	signalclient "github.com/netbirdio/netbird/shared/signal/client"
 	"github.com/netbirdio/netbird/version"
 )
 
@@ -47,6 +49,11 @@ type OfferAnswer struct {
 	RelaySrvIP netip.Addr
 	// SessionID is the unique identifier of the session, used to discard old messages
 	SessionID *ICESessionID
+
+	// Features are the protocol features supported by the sending peer.
+	Features []uint32
+	// MultipathPaths are the sender's extra underlay paths.
+	MultipathPaths []multipath.PathEndpoint
 }
 
 func (o *OfferAnswer) hasICECredentials() bool {
@@ -66,8 +73,9 @@ type Handshaker struct {
 	// this is to avoid blocking the handshaker if the listener is doing some heavy processing
 	// and also to avoid processing old offers if multiple offers are received in a short time
 	// the listener will always process the latest offer
-	relayListener *AsyncOfferListener
-	iceListener   func(remoteOfferAnswer *OfferAnswer)
+	relayListener     *AsyncOfferListener
+	iceListener       func(remoteOfferAnswer *OfferAnswer)
+	multipathListener func(remoteOfferAnswer *OfferAnswer)
 
 	// remoteICESupported tracks whether the remote peer includes ICE credentials in its offers/answers.
 	// When false, the local side skips ICE listener dispatch and suppresses ICE credentials in responses.
@@ -112,6 +120,10 @@ func (h *Handshaker) AddICEListener(offer func(remoteOfferAnswer *OfferAnswer)) 
 	h.iceListener = offer
 }
 
+func (h *Handshaker) AddMultipathListener(offer func(remoteOfferAnswer *OfferAnswer)) {
+	h.multipathListener = offer
+}
+
 func (h *Handshaker) Listen(ctx context.Context) {
 	for {
 		select {
@@ -131,6 +143,10 @@ func (h *Handshaker) Listen(ctx context.Context) {
 
 			if h.iceListener != nil && h.RemoteICESupported() {
 				h.iceListener(&remoteOfferAnswer)
+			}
+
+			if h.multipathListener != nil {
+				h.multipathListener(&remoteOfferAnswer)
 			}
 
 			if err := h.sendAnswer(); err != nil {
@@ -153,6 +169,10 @@ func (h *Handshaker) Listen(ctx context.Context) {
 
 			if h.iceListener != nil && h.RemoteICESupported() {
 				h.iceListener(&remoteOfferAnswer)
+			}
+
+			if h.multipathListener != nil {
+				h.multipathListener(&remoteOfferAnswer)
 			}
 		case <-ctx.Done():
 			h.log.Infof("stop listening for remote offers and answers")
@@ -239,6 +259,16 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 	if addr, ip, err := h.relay.RelayInstanceAddress(); err == nil {
 		answer.RelaySrvAddress = addr
 		answer.RelaySrvIP = ip
+	}
+
+	if h.config.Multipath != nil {
+		paths, err := h.config.Multipath.LocalPaths(h.config.Key)
+		if err != nil {
+			h.log.Warnf("multipath: local paths: %v", err)
+		} else if len(paths) > 0 {
+			answer.MultipathPaths = paths
+			answer.Features = append(answer.Features, signalclient.Multipath)
+		}
 	}
 
 	return answer

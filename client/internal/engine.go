@@ -44,6 +44,7 @@ import (
 	"github.com/netbirdio/netbird/client/internal/expose"
 	"github.com/netbirdio/netbird/client/internal/ingressgw"
 	"github.com/netbirdio/netbird/client/internal/lazyconn"
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/metrics"
 	"github.com/netbirdio/netbird/client/internal/netflow"
 	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
@@ -170,6 +171,9 @@ type EngineConfig struct {
 
 	MTU uint16
 
+	// Multipath spreads peer connections over extra underlay paths on Linux.
+	Multipath multipath.Config
+
 	// for debug bundle generation
 	ProfileConfig *profilemanager.Config
 
@@ -236,7 +240,8 @@ type Engine struct {
 
 	started bool
 
-	wgInterface WGIface
+	wgInterface      WGIface
+	multipathManager multipath.Manager
 
 	// wgDevice is a lock-free handle on the WireGuard device behind
 	// wgInterface. Reaching the device through wgInterface requires
@@ -643,6 +648,17 @@ func (e *Engine) Start(netbirdConfig *mgmProto.NetbirdConfig, mgmtURL *url.URL) 
 
 	if filteredDevice := e.wgInterface.GetDevice(); filteredDevice != nil {
 		filteredDevice.SetPanicHandler(e.triggerClientRestart)
+	}
+
+	if e.config.Multipath.Enabled && !e.wgInterface.IsUserspaceBind() {
+		manager, err := multipath.NewManager(e.config.Multipath)
+		if err != nil {
+			log.Errorf("multipath is enabled but cannot start: %v", err)
+		} else if manager == nil {
+			log.Infof("multipath is not supported in this interface mode, continuing with a single path")
+		} else {
+			e.multipathManager = manager
+		}
 	}
 
 	if err := e.createFirewall(); err != nil {
@@ -1985,8 +2001,10 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 			Addr:           e.getRosenpassAddr(),
 			PermissiveMode: e.config.RosenpassPermissive,
 		},
-		ICEConfig: e.createICEConfig(),
-		NetMgr:    e.netMgr,
+		ICEConfig:            e.createICEConfig(),
+		NetMgr:               e.netMgr,
+		Multipath:            e.multipathManager,
+		PresharedKeyProvider: e.presharedKeyProvider(),
 	}
 
 	serviceDependencies := peer.ServiceDependencies{
@@ -2010,6 +2028,15 @@ func (e *Engine) createPeerConn(pubKey string, allowedIPs []netip.Prefix, agentV
 	}
 
 	return peerConn, nil
+}
+
+// presharedKeyProvider exposes the Rosenpass-managed key of a peer to the
+// multipath manager. Nil when Rosenpass is disabled.
+func (e *Engine) presharedKeyProvider() func(peerKey string) (wgtypes.Key, bool) {
+	if e.rpManager == nil {
+		return nil
+	}
+	return e.rpManager.CurrentPresharedKey
 }
 
 // receiveSignalEvents connects to the Signal Service event stream to negotiate connection with remote peers
@@ -2148,6 +2175,13 @@ func (e *Engine) close() {
 	if e.afpacketCapture != nil {
 		e.afpacketCapture.Stop()
 		e.afpacketCapture = nil
+	}
+
+	if e.multipathManager != nil {
+		if err := e.multipathManager.Close(); err != nil {
+			log.Warnf("failed to stop multipath manager: %s", err)
+		}
+		e.multipathManager = nil
 	}
 
 	log.Debugf("removing Netbird interface %s", e.config.WgIfaceName)
@@ -3000,8 +3034,27 @@ func convertToOfferAnswer(msg *sProto.Message) (*peer.OfferAnswer, error) {
 		RelaySrvAddress: msg.GetBody().GetRelayServerAddress(),
 		RelaySrvIP:      relayIP,
 		SessionID:       sessionID,
+		Features:        msg.GetBody().GetFeaturesSupported(),
+		MultipathPaths:  decodeMultipathPaths(msg.GetBody().GetMultipathPaths()),
 	}
 	return &offerAnswer, nil
+}
+
+// decodeMultipathPaths converts wire path endpoints, dropping malformed ones.
+func decodeMultipathPaths(in []*sProto.PathEndpoint) []multipath.PathEndpoint {
+	out := make([]multipath.PathEndpoint, 0, len(in))
+	for _, p := range in {
+		addr, ok := netip.AddrFromSlice(p.GetIp())
+		if !ok || p.GetPort() == 0 || p.GetPort() > 65535 || p.GetProbePort() > 65535 {
+			continue
+		}
+		out = append(out, multipath.PathEndpoint{
+			Addr:      addr.Unmap(),
+			Port:      uint16(p.GetPort()),
+			ProbePort: uint16(p.GetProbePort()),
+		})
+	}
+	return out
 }
 
 // decodeRelayIP decodes the proto relayServerIP bytes (4 or 16) into a

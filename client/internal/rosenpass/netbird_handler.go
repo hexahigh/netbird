@@ -87,6 +87,29 @@ func (h *NetbirdHandler) IsPeerInitialized(pid rp.PeerID) bool {
 	return ok && peer.initialized
 }
 
+// CurrentPresharedKey returns the key to program for a peer right now: the
+// last exchanged key when one exists, otherwise the rendezvous key both ends
+// derive without communication.
+func (h *NetbirdHandler) CurrentPresharedKey(pid rp.PeerID) (wgtypes.Key, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	peer, ok := h.peers[pid]
+	if !ok {
+		return wgtypes.Key{}, false
+	}
+	if peer.initialized && peer.chainKey != nil {
+		return *peer.chainKey, true
+	}
+
+	rendezvous, err := h.rendezvousKey(peer)
+	if err != nil {
+		log.Errorf("failed to derive rendezvous key: %v", err)
+		return wgtypes.Key{}, false
+	}
+	return rendezvous, true
+}
+
 // HandshakeCompleted programs the freshly exchanged output key and resets the
 // peer's key recovery state.
 func (h *NetbirdHandler) HandshakeCompleted(pid rp.PeerID, key rp.Key) {

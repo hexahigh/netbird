@@ -248,6 +248,12 @@ message LoginRequest {
   // remoteJobsAllowed opts the peer into management-requested remote jobs
   // (e.g. debug bundles). Absent leaves the stored value unchanged.
   optional bool remoteJobsAllowed = 43;
+
+  // Multipath spreads a peer connection over extra underlay paths on Linux.
+  optional bool multipath = 44;
+  optional string multipath_mode = 45;
+  optional int32 multipath_max_paths = 46;
+  repeated string multipath_local_addresses = 47;
 }
 
 message LoginResponse {
@@ -369,6 +375,12 @@ message GetConfigResponse {
   bool disable_ipv6 = 27;
 
   bool remoteJobsAllowed = 29;
+
+  // Multipath settings.
+  bool multipath = 30;
+  string multipathMode = 31;
+  int32 multipathMaxPaths = 32;
+  repeated string multipathLocalAddresses = 33;
 
   // mDMManagedFields lists the names of configuration keys whose value is
   // currently enforced by an MDM policy. Names match mdm.Key* constants
@@ -780,6 +792,12 @@ message SetConfigRequest {
   // remoteJobsAllowed opts the peer into management-requested remote jobs
   // (e.g. debug bundles). Absent leaves the stored value unchanged.
   optional bool remoteJobsAllowed = 38;
+
+  // Multipath spreads a peer connection over extra underlay paths on Linux.
+  optional bool multipath = 39;
+  optional string multipath_mode = 40;
+  optional int32 multipath_max_paths = 41;
+  repeated string multipath_local_addresses = 42;
 }
 
 message SetConfigResponse{}

@@ -43,6 +43,10 @@ const (
 	dnsRouteIntervalFlag     = "dns-router-interval"
 	enableLazyConnectionFlag = "enable-lazy-connection"
 	mtuFlag                  = "mtu"
+	multipathFlag            = "multipath"
+	multipathModeFlag        = "multipath-mode"
+	multipathMaxPathsFlag    = "multipath-max-paths"
+	multipathAddressesFlag   = "multipath-local-addresses"
 )
 
 var (

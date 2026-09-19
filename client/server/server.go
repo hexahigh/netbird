@@ -609,6 +609,15 @@ func (s *Server) setConfigInputFromRequest(msg *proto.SetConfigRequest) (profile
 	config.RosenpassPermissive = msg.RosenpassPermissive
 	config.LocalMetricsEnabled = msg.EnableLocalMetrics
 	config.LocalMetricsAddress = msg.LocalMetricsAddress
+	config.Multipath = msg.Multipath
+	config.MultipathMode = msg.MultipathMode
+	if msg.MultipathMaxPaths != nil {
+		maxPaths := int(*msg.MultipathMaxPaths)
+		config.MultipathMaxPaths = &maxPaths
+	}
+	if msg.MultipathLocalAddresses != nil {
+		config.MultipathLocalAddresses = msg.MultipathLocalAddresses
+	}
 	config.DisableAutoConnect = msg.DisableAutoConnect
 	config.ServerSSHAllowed = msg.ServerSSHAllowed
 	config.RemoteJobsAllowed = msg.RemoteJobsAllowed
@@ -2286,6 +2295,10 @@ func (s *Server) GetConfig(ctx context.Context, req *proto.GetConfigRequest) (*p
 		EnableSSHRemotePortForwarding: enableSSHRemotePortForwarding,
 		DisableSSHAuth:                disableSSHAuth,
 		SshJWTCacheTTL:                sshJWTCacheTTL,
+		Multipath:                     cfg.Multipath,
+		MultipathMode:                 cfg.MultipathMode,
+		MultipathMaxPaths:             int32(cfg.MultipathMaxPaths),
+		MultipathLocalAddresses:       cfg.MultipathLocalAddresses,
 		MDMManagedFields:              cfg.Policy().ManagedKeys(),
 	}, nil
 }

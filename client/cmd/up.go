@@ -52,13 +52,17 @@ const (
 var errDaemonActiveProfileUnsupported = errors.New("daemon does not support active profile lookup")
 
 var (
-	foregroundMode     bool
-	dnsLabels          []string
-	dnsLabelsValidated domain.List
-	noBrowser          bool
-	showQR             bool
-	profileName        string
-	configPath         string
+	foregroundMode          bool
+	dnsLabels               []string
+	dnsLabelsValidated      domain.List
+	noBrowser               bool
+	showQR                  bool
+	profileName             string
+	multipathEnabled        bool
+	multipathMode           string
+	multipathMaxPaths       int
+	multipathLocalAddresses []string
+	configPath              string
 
 	upCmd = &cobra.Command{
 		Use:   "up",
@@ -93,6 +97,10 @@ func init() {
 	upCmd.PersistentFlags().StringVar(&profileName, profileNameFlag, "", profileNameDesc)
 	upCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "", "(DEPRECATED) NetBird config file location. ")
 
+	upCmd.PersistentFlags().BoolVar(&multipathEnabled, multipathFlag, false, "[Experimental] Spread peer connections over several underlay paths. Requires kernel WireGuard on Linux and additional underlay addresses.")
+	upCmd.PersistentFlags().StringVar(&multipathMode, multipathModeFlag, "flow", "Multipath path selection mode: flow.")
+	upCmd.PersistentFlags().IntVar(&multipathMaxPaths, multipathMaxPathsFlag, 2, "Maximum number of paths per peer, including the main connection (2-8).")
+	upCmd.PersistentFlags().StringSliceVar(&multipathLocalAddresses, multipathAddressesFlag, nil, "Extra underlay IP addresses to bind paths to, e.g. --multipath-local-addresses 192.168.6.161,192.168.6.162. An empty string clears the list.")
 }
 
 func upFunc(cmd *cobra.Command, args []string) error {
@@ -113,6 +121,10 @@ func upFunc(cmd *cobra.Command, args []string) error {
 
 	dnsLabelsValidated, err = validateDnsLabels(dnsLabels)
 	if err != nil {
+		return err
+	}
+
+	if err := validateMultipathFlags(cmd); err != nil {
 		return err
 	}
 
@@ -561,7 +573,45 @@ func setupSetConfigReq(customDNSAddressConverted []byte, cmd *cobra.Command, pro
 		req.LocalMetricsAddress = &localMetricsAddr
 	}
 
+	if cmd.Flag(multipathFlag).Changed {
+		req.Multipath = &multipathEnabled
+	}
+	if cmd.Flag(multipathModeFlag).Changed {
+		req.MultipathMode = &multipathMode
+	}
+	if cmd.Flag(multipathMaxPathsFlag).Changed {
+		maxPaths := int32(multipathMaxPaths)
+		req.MultipathMaxPaths = &maxPaths
+	}
+	if cmd.Flag(multipathAddressesFlag).Changed {
+		req.MultipathLocalAddresses = multipathLocalAddresses
+	}
+
 	return &req
+}
+
+// validateMultipathFlags checks the multipath flag combination before it is
+// sent to the daemon or written to the config file.
+func validateMultipathFlags(cmd *cobra.Command) error {
+	if !cmd.Flag(multipathFlag).Changed && !cmd.Flag(multipathModeFlag).Changed &&
+		!cmd.Flag(multipathMaxPathsFlag).Changed && !cmd.Flag(multipathAddressesFlag).Changed {
+		return nil
+	}
+	if multipathMode != "flow" && multipathMode != "rr" {
+		return fmt.Errorf("invalid multipath mode %q: must be flow or rr", multipathMode)
+	}
+	if multipathMaxPaths < 2 || multipathMaxPaths > 8 {
+		return fmt.Errorf("multipath max paths must be between 2 and 8, got %d", multipathMaxPaths)
+	}
+	for _, raw := range multipathLocalAddresses {
+		if raw == "" {
+			continue
+		}
+		if _, err := netip.ParseAddr(raw); err != nil {
+			return fmt.Errorf("invalid multipath local address %q: %w", raw, err)
+		}
+	}
+	return nil
 }
 
 func setupConfig(customDNSAddressConverted []byte, cmd *cobra.Command, configFilePath string) (*profilemanager.ConfigInput, error) {
@@ -687,6 +737,20 @@ func setupConfig(customDNSAddressConverted []byte, cmd *cobra.Command, configFil
 		ic.LocalMetricsAddress = &localMetricsAddr
 	}
 
+	if cmd.Flag(multipathFlag).Changed {
+		ic.Multipath = &multipathEnabled
+	}
+	if cmd.Flag(multipathModeFlag).Changed {
+		ic.MultipathMode = &multipathMode
+	}
+	if cmd.Flag(multipathMaxPathsFlag).Changed {
+		maxPaths := multipathMaxPaths
+		ic.MultipathMaxPaths = &maxPaths
+	}
+	if cmd.Flag(multipathAddressesFlag).Changed {
+		ic.MultipathLocalAddresses = multipathLocalAddresses
+	}
+
 	return &ic, nil
 }
 
@@ -757,6 +821,20 @@ func setupLoginRequest(providedSetupKey string, customDNSAddressConverted []byte
 
 	if cmd.Flag(localMetricsAddressFlag).Changed {
 		loginRequest.LocalMetricsAddress = &localMetricsAddr
+	}
+
+	if cmd.Flag(multipathFlag).Changed {
+		loginRequest.Multipath = &multipathEnabled
+	}
+	if cmd.Flag(multipathModeFlag).Changed {
+		loginRequest.MultipathMode = &multipathMode
+	}
+	if cmd.Flag(multipathMaxPathsFlag).Changed {
+		maxPaths := int32(multipathMaxPaths)
+		loginRequest.MultipathMaxPaths = &maxPaths
+	}
+	if cmd.Flag(multipathAddressesFlag).Changed {
+		loginRequest.MultipathLocalAddresses = multipathLocalAddresses
 	}
 
 	if cmd.Flag(interfaceNameFlag).Changed {

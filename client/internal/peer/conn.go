@@ -17,6 +17,7 @@ import (
 	"github.com/netbirdio/netbird/client/iface/configurer"
 	"github.com/netbirdio/netbird/client/iface/wgproxy"
 	"github.com/netbirdio/netbird/client/internal/metrics"
+	"github.com/netbirdio/netbird/client/internal/multipath"
 	"github.com/netbirdio/netbird/client/internal/peer/conntype"
 	"github.com/netbirdio/netbird/client/internal/peer/dispatcher"
 	"github.com/netbirdio/netbird/client/internal/peer/guard"
@@ -29,6 +30,7 @@ import (
 	"github.com/netbirdio/netbird/client/netevents"
 	"github.com/netbirdio/netbird/route"
 	relayClient "github.com/netbirdio/netbird/shared/relay/client"
+	signalclient "github.com/netbirdio/netbird/shared/signal/client"
 )
 
 // wgTimeoutEscalationThreshold is the number of consecutive WireGuard
@@ -98,6 +100,14 @@ type ConnConfig struct {
 	// NetMgr gates the reconnection guard on OS-reported network
 	// availability; nil disables gating.
 	NetMgr *netevents.Manager
+
+	// Multipath spreads this connection over extra underlay paths when
+	// non-nil.
+	Multipath multipath.Manager
+
+	// PresharedKeyProvider returns the Rosenpass-managed preshared key
+	// currently in use for a peer. Nil when Rosenpass is disabled.
+	PresharedKeyProvider func(peerKey string) (wgtypes.Key, bool)
 }
 
 type Conn struct {
@@ -258,6 +268,9 @@ func (conn *Conn) open(engineCtx context.Context, firstPacket []byte) error {
 	if !forceRelay {
 		conn.handshaker.AddICEListener(conn.workerICE.OnNewOffer)
 	}
+	if conn.config.Multipath != nil {
+		conn.handshaker.AddMultipathListener(conn.onRemoteMultipath)
+	}
 
 	conn.guard = guard.NewGuard(conn.Log, conn.isConnectedOnAllWay, conn.config.Timeout, conn.srWatcher, conn.config.NetMgr)
 
@@ -340,6 +353,10 @@ func (conn *Conn) Close(signalToRemote bool) {
 		conn.Log.Errorf("failed to remove wg endpoint: %v", err)
 	}
 
+	if conn.config.Multipath != nil {
+		conn.config.Multipath.RemovePeer(conn.config.Key)
+	}
+
 	if conn.evalStatus() == StatusConnected && conn.onDisconnected != nil {
 		conn.onDisconnected(conn.config.WgConfig.RemoteKey)
 	}
@@ -411,6 +428,48 @@ func (conn *Conn) ConnID() id.ConnID {
 }
 
 // configureConnection starts proxying traffic from/to local Wireguard and sets connection status to StatusConnected
+// onRemoteMultipath applies the extra underlay paths advertised by the remote
+// peer. It runs on the handshaker goroutine.
+func (conn *Conn) onRemoteMultipath(offer *OfferAnswer) {
+	if conn.config.Multipath == nil {
+		return
+	}
+
+	remote := offer.MultipathPaths
+	if !slices.Contains(offer.Features, signalclient.Multipath) {
+		remote = nil
+	}
+	if err := conn.config.Multipath.Configure(conn.config.Key, remote, conn.config.WgConfig.AllowedIps); err != nil {
+		conn.Log.Errorf("multipath: configure paths: %v", err)
+		return
+	}
+	if len(remote) == 0 {
+		return
+	}
+	if psk := conn.pathPresharedKey(offer.RosenpassPubKey); psk != nil {
+		if err := conn.config.Multipath.SetPresharedKey(conn.config.Key, *psk, false); err != nil {
+			conn.Log.Errorf("multipath: apply preshared key: %v", err)
+		}
+	}
+}
+
+// pathPresharedKey returns the key the path peers must use, matching the main
+// peer's key selection and consulting Rosenpass once it has rotated the key.
+func (conn *Conn) pathPresharedKey(remoteRosenpassKey []byte) *wgtypes.Key {
+	psk := conn.presharedKey(remoteRosenpassKey)
+	if psk != nil {
+		return psk
+	}
+	initialized := conn.rosenpassInitializedPresharedKeyValidator != nil &&
+		conn.rosenpassInitializedPresharedKeyValidator(conn.config.Key)
+	if initialized && conn.config.PresharedKeyProvider != nil {
+		if key, ok := conn.config.PresharedKeyProvider(conn.config.Key); ok {
+			return &key
+		}
+	}
+	return nil
+}
+
 func (conn *Conn) onICEConnectionIsReady(priority conntype.ConnPriority, iceConnInfo ICEConnInfo) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()

@@ -75,6 +75,21 @@ message Body {
   // fallback dial target when DNS resolution of relayServerAddress fails.
   // SNI/TLS verification still uses relayServerAddress.
   optional bytes relayServerIP = 11;
+
+  // multipathPaths are the extra underlay WireGuard paths the sender
+  // advertises for this peer, in addition to the main connection. Only
+  // present when both peers advertise the multipath feature.
+  repeated PathEndpoint multipathPaths = 12;
+}
+
+// PathEndpoint describes one extra underlay WireGuard path.
+message PathEndpoint {
+  // ip is the underlay address, encoded as 4 bytes (IPv4) or 16 bytes (IPv6).
+  bytes ip = 1;
+  // port is the WireGuard listen port of the path interface.
+  uint32 port = 2;
+  // probePort is the UDP echo port used for path liveness checks.
+  uint32 probePort = 3;
 }
 
 // Mode indicates a connection mode

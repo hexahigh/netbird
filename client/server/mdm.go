@@ -263,7 +263,11 @@ func loginRequestHasConfigOverrides(msg *proto.LoginRequest) bool {
 		len(msg.DnsLabels) > 0 || msg.CleanDNSLabels ||
 		msg.BlockInbound != nil ||
 		msg.EnableLocalMetrics != nil ||
-		msg.LocalMetricsAddress != nil
+		msg.LocalMetricsAddress != nil ||
+		msg.Multipath != nil ||
+		msg.MultipathMode != nil ||
+		msg.MultipathMaxPaths != nil ||
+		len(msg.MultipathLocalAddresses) > 0
 }
 
 // loginRequestMDMConflicts mirrors mdmManagedFieldConflicts but for the
