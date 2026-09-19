@@ -36,6 +36,9 @@ const (
 	maxPlacementFailures = 5
 	// placementRetryDelay is the pause before a failed measurement is retried.
 	placementRetryDelay = 2 * time.Second
+	// counterSettleDelay lets the bond qdisc drain into the slaves before the
+	// transmit counters are read; reading earlier misses the burst.
+	counterSettleDelay = 300 * time.Millisecond
 	// burstPort is the destination port of the placement burst. Traffic to it
 	// is expected to be dropped by the remote peer; only the local egress
 	// bond member matters.
@@ -133,6 +136,7 @@ func (p *linuxProbe) measure(peer *peerPaths, devIndex int, slaves []string) (st
 	if sent < minBurstBytes {
 		return "", fmt.Errorf("burst too small: %d bytes", sent)
 	}
+	time.Sleep(counterSettleDelay)
 	after, err := readSlaveCounters(slaves)
 	if err != nil {
 		return "", err
@@ -297,9 +301,6 @@ func (m *linuxManager) placeWithProbeLocked(peer *peerPaths, probe placementProb
 		}
 		return
 	}
-	peer.placementFailures = 0
-	peer.placedSig = sig
-
 	changed := false
 	placed := make(map[string]string)
 	for idx := 1; idx <= len(peer.extras); idx++ {
@@ -307,20 +308,33 @@ func (m *linuxManager) placeWithProbeLocked(peer *peerPaths, probe placementProb
 		if p == nil || !p.remote.IsValid() {
 			continue
 		}
-		changed = m.placePathLocked(peer, p, mainMember, slaves, probe) || changed
+		pathChanged, err := m.placePathLocked(peer, p, mainMember, slaves, probe)
+		if err != nil {
+			peer.placementFailures++
+			if peer.placementFailures <= maxPlacementFailures {
+				m.log.Debugf("cannot place path %s yet: %v", p.name, err)
+				m.schedulePlacementRetry(peer.key)
+			} else {
+				m.log.Warnf("giving up bond member placement for peer %s: %v", peer.key, err)
+				peer.placedSig = sig
+			}
+			return
+		}
+		changed = changed || pathChanged
 		if p.member != "" {
 			placed[p.name] = p.member
 		}
 	}
 	m.log.Infof("peer %s main path on bond member %s, paths on %v", peer.key, mainMember, placed)
 
+	peer.placementFailures = 0
+	peer.placedSig = sig
 	if changed {
 		m.notifyPortsChangedLocked(peer.key)
 		return
 	}
 	// The placement is stable; allow future rounds after a topology change.
 	peer.placementRounds = 0
-	peer.placementFailures = 0
 }
 
 // schedulePlacementRetry retries a failed measurement after a short delay,
@@ -361,35 +375,35 @@ func placementSignature(peer *peerPaths) string {
 // from the main path's. It returns true when the port changed. When no port
 // moves the path off the main member, for example because the bond hash does
 // not include ports, the original port is restored so the peer is not sent
-// chasing ports that do not help.
-func (m *linuxManager) placePathLocked(peer *peerPaths, p *pathState, mainMember string, slaves []string, probe placementProbe) bool {
+// chasing ports that do not help. A measurement failure is returned so the
+// caller can retry once the path session is up.
+func (m *linuxManager) placePathLocked(peer *peerPaths, p *pathState, mainMember string, slaves []string, probe placementProbe) (bool, error) {
 	originalPort := p.port
 	collisions := 0
 	for attempt := 0; attempt <= maxPlacementAttempts; attempt++ {
 		member, err := probe.measure(peer, p.linkIndex, slaves)
 		if err != nil {
-			m.log.Debugf("cannot measure path %s: %v", p.name, err)
 			m.revertPortLocked(p, originalPort)
-			return false
+			return false, err
 		}
 		p.member = member
 		if member != mainMember {
-			return p.port != originalPort
+			return p.port != originalPort, nil
 		}
 		collisions++
 		if collisions >= maxPlacementAttempts {
 			m.log.Warnf("multipath: path %s stays on bond member %s, the bond hash does not move with ports", p.name, mainMember)
 			m.revertPortLocked(p, originalPort)
-			return false
+			return false, nil
 		}
 		if err := m.rerollPortLocked(peer, p, attempt+1); err != nil {
 			m.log.Warnf("multipath: cannot move path %s off member %s: %v", p.name, mainMember, err)
 			m.revertPortLocked(p, originalPort)
-			return false
+			return false, nil
 		}
 	}
 	m.revertPortLocked(p, originalPort)
-	return false
+	return false, nil
 }
 
 // revertPortLocked restores a path's original listen port after a placement
