@@ -92,6 +92,7 @@ func NewManager(cfg Config) (Manager, error) {
 	}
 	m.probe = &linuxProbe{m: m}
 	m.setDevicePort = m.setPort
+	m.routeCheck = m.checkRoute
 	m.placementPending = make(map[string]bool)
 	go m.observerLoop()
 	go m.notifyLoop()
@@ -125,6 +126,10 @@ type linuxManager struct {
 	hashPolicyOrig   int
 	hashPolicyChange bool
 
+	// routeCheck reports whether a remote path address is reachable through
+	// the interface that owns the local path address. Overridable in tests.
+	routeCheck func(local, remote netip.Addr) error
+
 	// ifaceDirty signals the observer loop that the set of path interfaces
 	// changed, so observers (the firewall) can be updated without holding m.mu.
 	ifaceDirty    chan struct{}
@@ -148,6 +153,15 @@ type peerPaths struct {
 	allowedIPs []netip.Prefix
 	overlayIPs []netip.Addr
 	psk        *wgtypes.Key
+	// lastRemoteSig identifies the remote path list last configured, and
+	// unreachableSig the list whose addresses are not routable through the
+	// configured local path addresses. noRemotePaths is set when the peer
+	// advertised multipath but no usable paths, so local paths are not
+	// recreated on every offer.
+	lastRemoteSig  string
+	unreachableSig string
+	noRemotePaths  bool
+
 	// placedSig is the last placement input, so repeated offers do not rerun
 	// the measurement; placementRounds bounds re-rolls between two peers, and
 	// placementFailures bounds retries when a measurement keeps failing.
@@ -194,6 +208,11 @@ func (m *linuxManager) LocalPaths(peerKey string) ([]PathEndpoint, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Do not create interfaces for a peer whose paths are known to be
+	// unreachable, or that advertised no usable paths.
+	if peer.unreachableSig != "" || peer.noRemotePaths {
+		return nil, nil
+	}
 	if err := m.ensurePathsLocked(peer); err != nil {
 		return nil, err
 	}
@@ -236,20 +255,63 @@ func (m *linuxManager) Configure(peerKey string, remote []PathEndpoint, allowedI
 	}
 
 	if wanted == 0 {
+		if len(peer.extras) > 0 {
+			// The peer advertised multipath but no usable paths. Stop
+			// creating local paths until its path list changes.
+			peer.noRemotePaths = true
+			m.removeExtrasLocked(peer)
+			m.clearRouteLocked(peer)
+			m.markInterfacesDirty()
+		}
+		return nil
+	}
+	peer.noRemotePaths = false
+
+	sig := remoteSignature(remote[:wanted])
+	peer.lastRemoteSig = sig
+	if peer.unreachableSig == sig {
 		m.removeExtrasLocked(peer)
 		m.clearRouteLocked(peer)
 		m.markInterfacesDirty()
 		return nil
 	}
-
-	if err := m.ensurePathsLocked(peer); err != nil {
-		return err
+	if peer.unreachableSig != "" && peer.unreachableSig != sig {
+		peer.unreachableSig = ""
 	}
+
 	// Drop extras the remote does not use.
 	for idx, p := range peer.extras {
 		if idx > wanted {
 			m.removePathLocked(peer, p)
 		}
+	}
+
+	// Check reachability before creating anything. A peer whose path
+	// addresses are not routable through the configured local address keeps
+	// using the main connection, and no path interfaces are created for it.
+	for i := 0; i < wanted; i++ {
+		if err := m.routeCheck(m.extraAddrs[i], remote[i].Addr); err != nil {
+			m.log.Infof("multipath: %s is not reachable from %s, keeping peer %s on the main connection: %v",
+				remote[i].Addr, m.extraAddrs[i], peerKey, err)
+			peer.unreachableSig = sig
+			m.removeExtrasLocked(peer)
+			m.clearRouteLocked(peer)
+			m.markInterfacesDirty()
+			return nil
+		}
+	}
+
+	created := false
+	for idx := 1; idx <= wanted; idx++ {
+		if peer.extras[idx] != nil {
+			continue
+		}
+		p, err := m.createPathLocked(peer, idx, m.extraAddrs[idx-1])
+		if err != nil {
+			return err
+		}
+		peer.extras[idx] = p
+		created = true
 	}
 
 	remoteKey, err := wgtypes.ParseKey(peerKey)
@@ -258,18 +320,47 @@ func (m *linuxManager) Configure(peerKey string, remote []PathEndpoint, allowedI
 	}
 
 	for idx := 1; idx <= wanted; idx++ {
-		p := peer.extras[idx]
-		if p == nil {
-			return fmt.Errorf("multipath: path %d was not created", idx)
-		}
-		if err := m.configurePathLocked(peer, p, remoteKey, remote[idx-1]); err != nil {
+		if err := m.configurePathLocked(peer, peer.extras[idx], remoteKey, remote[idx-1]); err != nil {
 			return err
 		}
 	}
 
 	m.applyRouteLocked(peer)
 	m.markInterfacesDirty()
+	if created {
+		// The peer has to learn about the endpoints that were just created.
+		m.notifyPortsChangedLocked(peer.key)
+	}
 	m.schedulePlacementLocked(peer.key)
+	return nil
+}
+
+// remoteSignature identifies one remote path list.
+func remoteSignature(remote []PathEndpoint) string {
+	var b strings.Builder
+	for _, r := range remote {
+		fmt.Fprintf(&b, "%s:%d/%d;", r.Addr, r.Port, r.ProbePort)
+	}
+	return b.String()
+}
+
+// checkRoute reports whether a remote path address is reachable through the
+// interface that owns the local path address.
+func (m *linuxManager) checkRoute(local, remote netip.Addr) error {
+	ifaceIndex, err := ifaceIndexForAddr(local)
+	if err != nil {
+		return err
+	}
+	routes, err := netlink.RouteGetWithOptions(remote.AsSlice(), &netlink.RouteGetOptions{
+		OifIndex: ifaceIndex,
+		SrcAddr:  local.AsSlice(),
+	})
+	if err != nil {
+		return err
+	}
+	if len(routes) == 0 {
+		return errors.New("no route")
+	}
 	return nil
 }
 

@@ -82,11 +82,9 @@ type Handshaker struct {
 	// When false, the local side skips ICE listener dispatch and suppresses ICE credentials in responses.
 	remoteICESupported atomic.Bool
 
-	// remoteMultipathKnown is set once an offer or answer has been received,
-	// and remoteMultipathSupported records whether it advertised the
-	// multipath feature. Until the first answer the local side advertises its
-	// own paths, so a capable peer learns about them immediately.
-	remoteMultipathKnown     atomic.Bool
+	// remoteMultipathSupported records whether the remote advertised the
+	// multipath feature. Path interfaces are only created once the remote
+	// supports the feature, so peers without it never get path interfaces.
 	remoteMultipathSupported atomic.Bool
 
 	// remoteOffersCh is a channel used to wait for remote credentials to proceed with the connection
@@ -271,36 +269,38 @@ func (h *Handshaker) buildOfferAnswer() OfferAnswer {
 		answer.RelaySrvIP = ip
 	}
 
-	if h.shouldAdvertiseMultipath() {
-		paths, err := h.config.Multipath.LocalPaths(h.config.Key)
-		if err != nil {
-			h.log.Warnf("multipath: local paths: %v", err)
-		} else if len(paths) > 0 {
-			answer.MultipathPaths = paths
-			answer.Features = append(answer.Features, signalclient.Multipath)
+	// Always advertise the capability so the peer can answer with its paths,
+	// but only create and advertise local paths once the peer has advertised
+	// support. A peer without support never gets path interfaces.
+	if h.config.Multipath != nil {
+		answer.Features = append(answer.Features, signalclient.Multipath)
+		if h.shouldAdvertiseMultipath() {
+			paths, err := h.config.Multipath.LocalPaths(h.config.Key)
+			if err != nil {
+				h.log.Warnf("multipath: local paths: %v", err)
+			} else if len(paths) > 0 {
+				answer.MultipathPaths = paths
+			}
 		}
 	}
 
 	return answer
 }
 
-// shouldAdvertiseMultipath reports whether local paths belong in an offer or
-// answer. Before the first remote offer or answer arrives the local side
-// advertises, so a capable peer can pick the paths up immediately; once the
-// remote is known not to support multipath the local side stops creating and
-// removing path interfaces on every offer.
+// shouldAdvertiseMultipath reports whether local path interfaces should be
+// created and advertised. It only happens once the remote has advertised the
+// feature, so peers that do not support multipath never get path interfaces.
 func (h *Handshaker) shouldAdvertiseMultipath() bool {
 	if h.config.Multipath == nil {
 		return false
 	}
-	return !h.remoteMultipathKnown.Load() || h.remoteMultipathSupported.Load()
+	return h.remoteMultipathSupported.Load()
 }
 
 func (h *Handshaker) updateRemoteMultipathState(offer *OfferAnswer) {
 	if h.config.Multipath == nil {
 		return
 	}
-	h.remoteMultipathKnown.Store(true)
 	h.remoteMultipathSupported.Store(slices.Contains(offer.Features, signalclient.Multipath))
 }
 

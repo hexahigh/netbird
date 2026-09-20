@@ -3,6 +3,7 @@
 package multipath
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 
@@ -34,14 +35,60 @@ func (f *fakeProbe) measure(peer *peerPaths, devIndex int, _ []string) (string, 
 
 func newTestManager(mainIface int) *linuxManager {
 	return &linuxManager{
-		cfg:              Config{WgPort: 51820},
+		cfg:              Config{WgPort: 51820, MaxPaths: 2},
 		log:              log.WithField("component", "multipath-test"),
 		peers:            make(map[string]*peerPaths),
 		mainIface:        mainIface,
+		extraAddrs:       []netip.Addr{netip.MustParseAddr("10.10.0.11")},
 		setDevicePort:    func(_ string, port int) (int, error) { return port, nil },
+		routeCheck:       func(_, _ netip.Addr) error { return nil },
 		portsChanged:     make(chan string, 4),
 		placementPending: make(map[string]bool),
 	}
+}
+
+func TestRemoteSignature(t *testing.T) {
+	a := []PathEndpoint{{Addr: netip.MustParseAddr("10.10.0.21"), Port: 51821, ProbePort: 51822}}
+	b := []PathEndpoint{{Addr: netip.MustParseAddr("10.10.0.21"), Port: 51821, ProbePort: 51822}}
+	c := []PathEndpoint{{Addr: netip.MustParseAddr("10.10.0.22"), Port: 51821, ProbePort: 51822}}
+
+	assert.Equal(t, remoteSignature(a), remoteSignature(b))
+	assert.NotEqual(t, remoteSignature(a), remoteSignature(c))
+}
+
+func TestConfigureKeepsUnroutablePeerSinglePath(t *testing.T) {
+	m := newTestManager(100)
+	checks := 0
+	m.routeCheck = func(_, _ netip.Addr) error {
+		checks++
+		return errors.New("no route")
+	}
+	peer := &peerPaths{
+		key:        "peer-key",
+		extras:     make(map[int]*pathState),
+		overlayIPs: []netip.Addr{netip.MustParseAddr("100.64.0.3")},
+	}
+	m.peers[peer.key] = peer
+	allowed := []netip.Prefix{netip.MustParsePrefix("100.64.1.1/32")}
+	remote := []PathEndpoint{{Addr: netip.MustParseAddr("10.10.0.21"), Port: 51821, ProbePort: 51822}}
+
+	require.NoError(t, m.Configure(peer.key, remote, allowed))
+	assert.Equal(t, 1, checks)
+	assert.Empty(t, peer.extras, "no path interfaces for an unreachable peer")
+	assert.NotEmpty(t, peer.unreachableSig)
+
+	// The same remote list must not recreate anything or retry the check.
+	require.NoError(t, m.Configure(peer.key, remote, allowed))
+	assert.Equal(t, 1, checks, "the unreachable decision is remembered")
+
+	paths, err := m.LocalPaths(peer.key)
+	require.NoError(t, err)
+	assert.Empty(t, paths, "unreachable peers are not advertised")
+
+	// A changed remote list is retried.
+	remote2 := []PathEndpoint{{Addr: netip.MustParseAddr("10.10.0.22"), Port: 51821, ProbePort: 51822}}
+	require.NoError(t, m.Configure(peer.key, remote2, allowed))
+	assert.Equal(t, 2, checks)
 }
 
 func testPeer() (*peerPaths, *pathState) {

@@ -88,6 +88,13 @@ Both measurements adapt to any bond hash policy and are skipped on underlays
 that are not bonds. The chosen member is logged per path, and repeated offers
 with the same endpoints skip the measurement.
 
+Path interfaces are only created for a peer that advertises multipath support
+and whose path addresses are routable through the configured local addresses.
+A peer without support, or one whose paths cannot be reached through those
+addresses, stays on the main connection and gets no path interfaces. The
+decision is remembered per peer and retried only when the peer's path list
+changes.
+
 ## Multiple uplinks and public IPs
 
 A bond is not required. Each path is pinned to the interface that owns its
